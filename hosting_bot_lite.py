@@ -122,10 +122,9 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
     
     def log_message(self, format, *args):
-        pass  # Suppress health check logs
+        pass
 
 def start_health_server():
-    """Start a health check server on the Render-assigned port"""
     try:
         port = int(os.environ.get("PORT", 10000))
         server = HTTPServer(('0.0.0.0', port), HealthHandler)
@@ -242,59 +241,6 @@ def get_ultra_compressed_stats(refresh=False):
         _RESOURCE_CACHE['stats'] = stats
         _RESOURCE_CACHE_LAST_UPDATE = now
         return stats
-
-def update_deployment_resources(deployment_id=None):
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        if deployment_id:
-            c.execute("SELECT proc_pid, file_name FROM deployments WHERE deployment_id=? AND status='active'", (deployment_id,))
-            rows = c.fetchall()
-        else:
-            c.execute("SELECT deployment_id, proc_pid, file_name FROM deployments WHERE status='active'")
-            rows = c.fetchall()
-        conn.close()
-        
-        with _RESOURCE_CACHE_LOCK:
-            for row in rows:
-                if len(row) == 3:
-                    did, pid, fname = row
-                else:
-                    did, pid, fname = deployment_id, row[0], row[1] if len(row) > 1 else 'bot'
-                
-                if pid:
-                    ram = _get_ram_usage_pid(pid)
-                    cpu = _get_cpu_usage_pid(pid)
-                    _RESOURCE_CACHE[f'ram_{did}'] = ram
-                    _RESOURCE_CACHE[f'cpu_{did}'] = cpu
-                    _RESOURCE_CACHE[f'name_{did}'] = display_filename(str(fname))[:20] if fname else f'dep{did}'
-    except Exception:
-        pass
-
-def get_deployment_resources(deployment_id):
-    with _RESOURCE_CACHE_LOCK:
-        ram = _RESOURCE_CACHE.get(f'ram_{deployment_id}', 0)
-        cpu = _RESOURCE_CACHE.get(f'cpu_{deployment_id}', 0)
-        name = _RESOURCE_CACHE.get(f'name_{deployment_id}', f'dep{deployment_id}')
-    return f"{name} R:{ram:.1f}MB C:{cpu:.1f}%"
-
-def get_all_deployment_resources():
-    results = []
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("SELECT deployment_id, proc_pid, file_name FROM deployments WHERE status='active' AND proc_pid IS NOT NULL")
-        rows = c.fetchall()
-        conn.close()
-        
-        for did, pid, fname in rows:
-            ram = _get_ram_usage_pid(pid)
-            cpu = _get_cpu_usage_pid(pid)
-            name = display_filename(str(fname))[:20] if fname else f'dep{did}'
-            results.append(f"#{did}:{name} R:{ram:.0f} C:{cpu:.1f}")
-    except Exception:
-        pass
-    return results
 
 # ========== DATABASE SETUP ==========
 def init_db():
@@ -493,275 +439,7 @@ def init_db():
     conn.close()
     print("✅ Database initialized")
 
-# ========== DEPLOY FOLDER HELPER ==========
-def kill_deployment_process(pid, sig=None):
-    if sig is None:
-        sig = signal.SIGTERM
-    if not pid:
-        return
-    try:
-        target_pgid = os.getpgid(pid)
-        own_pgid = os.getpgid(os.getpid())
-        if target_pgid == own_pgid:
-            os.kill(pid, sig)
-            return
-        os.killpg(target_pgid, sig)
-    except (ProcessLookupError, PermissionError):
-        pass
-    except Exception:
-        try:
-            os.kill(pid, sig)
-        except Exception:
-            pass
-
-def get_deploy_folder(user_id, deployment_id):
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("SELECT folder_name, user_id FROM deployments WHERE deployment_id = ?", (deployment_id,))
-        row = c.fetchone()
-        conn.close()
-        if row and row[0]:
-            owner_id = row[1] if row[1] else user_id
-            return DEPLOYMENTS_DIR / str(owner_id) / str(row[0])
-    except Exception:
-        pass
-    return DEPLOYMENTS_DIR / str(user_id) / str(deployment_id)
-
 # ========== HELPERS ==========
-def db_execute(query, params=(), fetch='none', retries=5, delay=0.2):
-    for attempt in range(retries):
-        conn = None
-        try:
-            conn = sqlite3.connect(DATABASE_FILE, timeout=10)
-            conn.execute("PRAGMA journal_mode=WAL")
-            c = conn.cursor()
-            c.execute(query, params)
-            conn.commit()
-            if fetch == 'one':
-                return c.fetchone()
-            if fetch == 'all':
-                return c.fetchall()
-            return True
-        except sqlite3.OperationalError as e:
-            if 'locked' in str(e).lower() or 'busy' in str(e).lower():
-                if attempt < retries - 1:
-                    sleep(delay * (attempt + 1))
-                    continue
-            print(f"❌ DB error: {e}")
-            return None
-        except Exception as e:
-            print(f"❌ DB error: {e}")
-            return None
-        finally:
-            if conn:
-                try: conn.close()
-                except: pass
-    return None
-
-def get_user_info(user_id):
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute("SELECT first_name FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return {'first_name': row[0] if row else 'User'}
-
-def update_system_stats():
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM users")
-        total_users = c.fetchone()[0] or 0
-        c.execute("SELECT COUNT(*) FROM deployments")
-        total_deployments = c.fetchone()[0] or 0
-        c.execute("SELECT COUNT(*) FROM deployments WHERE status='active'")
-        active_deployments_count = c.fetchone()[0] or 0
-        c.execute("SELECT COUNT(*) FROM deployments WHERE status='paused'")
-        paused_deployments = c.fetchone()[0] or 0
-        c.execute("SELECT COUNT(*) FROM deployments WHERE is_free=1")
-        free_deployments = c.fetchone()[0] or 0
-        c.execute("SELECT SUM(coins_amount) FROM redeem_codes")
-        coins_created = c.fetchone()[0] or 0
-        c.execute("SELECT SUM(stars_amount) FROM redeem_codes")
-        stars_created = c.fetchone()[0] or 0
-        c.execute("SELECT SUM(amount) FROM star_transactions WHERE transaction_type='subscription' AND status='completed'")
-        revenue_stars = c.fetchone()[0] or 0
-        c.execute("SELECT COUNT(*) FROM users WHERE is_premium=1")
-        premium_users = c.fetchone()[0] or 0
-        revenue_usd = revenue_stars * 0.01
-        
-        c.execute('''UPDATE system_stats SET 
-            total_users=?, total_deployments=?, total_active_deployments=?,
-            total_paused_deployments=?, total_free_deployments=?, total_coins_created=?,
-            total_stars_created=?, total_revenue_stars=?, total_revenue_usd=?,
-            premium_users=?, last_updated=?
-            WHERE id=1''',
-            (total_users, total_deployments, active_deployments_count, paused_deployments,
-             free_deployments, coins_created, stars_created, revenue_stars, revenue_usd,
-             premium_users, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"❌ Update system stats error: {e}")
-
-def get_system_stats():
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute('SELECT * FROM system_stats WHERE id = 1')
-        row = c.fetchone()
-        conn.close()
-        if row:
-            return {
-                'total_users': row[1], 'total_deployments': row[2],
-                'active_deployments': row[3], 'paused_deployments': row[4],
-                'free_deployments': row[5], 'coins_created': row[6],
-                'stars_created': row[7], 'revenue_stars': row[8],
-                'revenue_usd': row[9], 'premium_users': row[10],
-                'server_start_time': row[11], 'last_updated': row[12]
-            }
-        return {}
-    except Exception as e:
-        print(f"❌ Get system stats error: {e}")
-        return {}
-
-def get_user_balances(user_id):
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute("SELECT coins_balance, stars_balance FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return {'coins': row[0] if row else 0, 'stars': row[1] if row else 0}
-
-def update_user_coins(user_id, delta, transaction_type="balance_update", source="system"):
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    try:
-        c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-        c.execute("UPDATE users SET coins_balance = coins_balance + ? WHERE user_id = ?", (delta, user_id))
-        if delta > 0:
-            c.execute("UPDATE users SET total_coins_earned = total_coins_earned + ? WHERE user_id = ?", (delta, user_id))
-        else:
-            c.execute("UPDATE users SET total_coins_spent = total_coins_spent + ? WHERE user_id = ?", (abs(delta), user_id))
-        c.execute('''INSERT INTO coin_transactions 
-            (user_id, amount, transaction_type, source, reference_id, timestamp, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)''',
-            (user_id, delta, transaction_type, source, None, datetime.now().isoformat(), 'completed'))
-        conn.commit()
-    except Exception as e:
-        print(f"❌ update_user_coins error: {e}")
-        conn.rollback()
-    finally:
-        conn.close()
-    update_system_stats()
-    return True
-
-def update_user_stars(user_id, delta, transaction_type="balance_update", source="system", payload=None):
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    try:
-        c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-        c.execute("UPDATE users SET stars_balance = stars_balance + ? WHERE user_id = ?", (delta, user_id))
-        if delta > 0:
-            c.execute("UPDATE users SET total_stars_earned = total_stars_earned + ? WHERE user_id = ?", (delta, user_id))
-        else:
-            c.execute("UPDATE users SET total_stars_spent = total_stars_spent + ? WHERE user_id = ?", (abs(delta), user_id))
-        c.execute('''INSERT INTO star_transactions 
-            (user_id, amount, transaction_type, source, reference_id, timestamp, status, payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-            (user_id, delta, transaction_type, source, None, datetime.now().isoformat(), 'completed', payload))
-        conn.commit()
-    except Exception as e:
-        print(f"❌ update_user_stars error: {e}")
-        conn.rollback()
-    finally:
-        conn.close()
-    update_system_stats()
-    return True
-
-def is_user_premium(user_id):
-    if is_admin(user_id):
-        return True
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute('''SELECT is_premium, premium_expires FROM users WHERE user_id = ?''', (user_id,))
-        row = c.fetchone()
-        conn.close()
-        if row and row[0] == 1 and row[1]:
-            expires = datetime.fromisoformat(row[1])
-            if expires > datetime.now():
-                return True
-        return False
-    except Exception:
-        return False
-
-def get_free_deployment_used_count(user_id):
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM deployments WHERE user_id = ? AND is_free = 1 AND status = 'active'", (user_id,))
-    count = c.fetchone()[0] or 0
-    conn.close()
-    return count
-
-def can_use_free_deployment(user_id):
-    if is_admin(user_id):
-        return True, "Admin - Unlimited"
-    if is_user_premium(user_id):
-        return True, "Premium - Unlimited"
-    used_count = get_free_deployment_used_count(user_id)
-    remaining = FREE_USER_MAX_DEPLOYMENTS - used_count
-    if remaining > 0:
-        return True, f"Free tier - {remaining} remaining"
-    else:
-        return False, f"Free tier limit reached ({used_count}/{FREE_USER_MAX_DEPLOYMENTS})"
-
-def stop_free_deployments_for_user(user_id):
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute("""SELECT deployment_id, proc_pid FROM deployments
-                 WHERE user_id = ? AND is_free = 1 AND status IN ('active','paused')""",
-              (user_id,))
-    rows = c.fetchall()
-    stopped = 0
-    for dep_id, proc_pid in rows:
-        if proc_pid:
-            try:
-                kill_deployment_process(proc_pid)
-            except Exception:
-                pass
-        c.execute("""UPDATE deployments SET status='stopped', proc_pid=NULL, is_paused=0
-                     WHERE deployment_id=?""", (dep_id,))
-        with deployment_lock:
-            active_deployments.pop(dep_id, None)
-        stopped += 1
-    conn.commit()
-    conn.close()
-    return stopped
-
-def activate_premium(user_id, plan, amount_stars, amount_coins, duration_days):
-    try:
-        end_date = datetime.now() + timedelta(days=duration_days)
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("UPDATE users SET is_premium=1, premium_expires=?, premium_plan=? WHERE user_id=?",
-                  (end_date.isoformat(), plan, user_id))
-        c.execute("""INSERT INTO subscriptions
-                     (user_id, plan, amount_stars, amount_coins, start_date, end_date, status)
-                     VALUES (?,?,?,?,?,?,?)""",
-                  (user_id, plan, amount_stars, amount_coins,
-                   datetime.now().isoformat(), end_date.isoformat(), 'active'))
-        conn.commit()
-        conn.close()
-        stopped_free = stop_free_deployments_for_user(user_id)
-        update_system_stats()
-        return True, 0
-    except Exception as e:
-        print(f"❌ Activate premium error: {e}")
-        return False, 0
-
-# ========== TELEGRAM FUNCTIONS ==========
 def send_message(chat_id, text, keyboard=None, parse_mode="Markdown"):
     url = f"{TELEGRAM_API}/sendMessage"
     text = str(text or '')[:4096]
@@ -908,6 +586,164 @@ def notify_admin(message):
         except Exception as e:
             print(f"Failed to notify admin {admin_id}: {e}")
 
+# ========== USER FUNCTIONS ==========
+def get_user_info(user_id):
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT first_name FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return {'first_name': row[0] if row else 'User'}
+
+def get_user_balances(user_id):
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT coins_balance, stars_balance FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return {'coins': row[0] if row else 0, 'stars': row[1] if row else 0}
+
+def update_user_coins(user_id, delta, transaction_type="balance_update", source="system"):
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        c.execute("UPDATE users SET coins_balance = coins_balance + ? WHERE user_id = ?", (delta, user_id))
+        if delta > 0:
+            c.execute("UPDATE users SET total_coins_earned = total_coins_earned + ? WHERE user_id = ?", (delta, user_id))
+        else:
+            c.execute("UPDATE users SET total_coins_spent = total_coins_spent + ? WHERE user_id = ?", (abs(delta), user_id))
+        c.execute('''INSERT INTO coin_transactions 
+            (user_id, amount, transaction_type, source, reference_id, timestamp, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            (user_id, delta, transaction_type, source, None, datetime.now().isoformat(), 'completed'))
+        conn.commit()
+    except Exception as e:
+        print(f"❌ update_user_coins error: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+    return True
+
+def update_user_stars(user_id, delta, transaction_type="balance_update", source="system", payload=None):
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        c.execute("UPDATE users SET stars_balance = stars_balance + ? WHERE user_id = ?", (delta, user_id))
+        if delta > 0:
+            c.execute("UPDATE users SET total_stars_earned = total_stars_earned + ? WHERE user_id = ?", (delta, user_id))
+        else:
+            c.execute("UPDATE users SET total_stars_spent = total_stars_spent + ? WHERE user_id = ?", (abs(delta), user_id))
+        c.execute('''INSERT INTO star_transactions 
+            (user_id, amount, transaction_type, source, reference_id, timestamp, status, payload)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            (user_id, delta, transaction_type, source, None, datetime.now().isoformat(), 'completed', payload))
+        conn.commit()
+    except Exception as e:
+        print(f"❌ update_user_stars error: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+    return True
+
+def is_user_premium(user_id):
+    # ADMINS ARE ALWAYS PREMIUM
+    if is_admin(user_id):
+        return True
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute('''SELECT is_premium, premium_expires FROM users WHERE user_id = ?''', (user_id,))
+        row = c.fetchone()
+        conn.close()
+        if row and row[0] == 1 and row[1]:
+            expires = datetime.fromisoformat(row[1])
+            if expires > datetime.now():
+                return True
+        return False
+    except Exception:
+        return False
+
+def update_system_stats():
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        total_users = c.fetchone()[0] or 0
+        c.execute("SELECT COUNT(*) FROM deployments")
+        total_deployments = c.fetchone()[0] or 0
+        c.execute("SELECT COUNT(*) FROM deployments WHERE status='active'")
+        active_deployments_count = c.fetchone()[0] or 0
+        c.execute("SELECT COUNT(*) FROM deployments WHERE status='paused'")
+        paused_deployments = c.fetchone()[0] or 0
+        c.execute("SELECT COUNT(*) FROM deployments WHERE is_free=1")
+        free_deployments = c.fetchone()[0] or 0
+        c.execute("SELECT SUM(coins_amount) FROM redeem_codes")
+        coins_created = c.fetchone()[0] or 0
+        c.execute("SELECT SUM(stars_amount) FROM redeem_codes")
+        stars_created = c.fetchone()[0] or 0
+        c.execute("SELECT SUM(amount) FROM star_transactions WHERE transaction_type='subscription' AND status='completed'")
+        revenue_stars = c.fetchone()[0] or 0
+        c.execute("SELECT COUNT(*) FROM users WHERE is_premium=1")
+        premium_users = c.fetchone()[0] or 0
+        revenue_usd = revenue_stars * 0.01
+        
+        c.execute('''UPDATE system_stats SET 
+            total_users=?, total_deployments=?, total_active_deployments=?,
+            total_paused_deployments=?, total_free_deployments=?, total_coins_created=?,
+            total_stars_created=?, total_revenue_stars=?, total_revenue_usd=?,
+            premium_users=?, last_updated=?
+            WHERE id=1''',
+            (total_users, total_deployments, active_deployments_count, paused_deployments,
+             free_deployments, coins_created, stars_created, revenue_stars, revenue_usd,
+             premium_users, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"❌ Update system stats error: {e}")
+
+def get_system_stats():
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute('SELECT * FROM system_stats WHERE id = 1')
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return {
+                'total_users': row[1], 'total_deployments': row[2],
+                'active_deployments': row[3], 'paused_deployments': row[4],
+                'free_deployments': row[5], 'coins_created': row[6],
+                'stars_created': row[7], 'revenue_stars': row[8],
+                'revenue_usd': row[9], 'premium_users': row[10],
+                'server_start_time': row[11], 'last_updated': row[12]
+            }
+        return {}
+    except Exception as e:
+        print(f"❌ Get system stats error: {e}")
+        return {}
+
+def get_free_deployment_used_count(user_id):
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM deployments WHERE user_id = ? AND is_free = 1 AND status = 'active'", (user_id,))
+    count = c.fetchone()[0] or 0
+    conn.close()
+    return count
+
+def can_use_free_deployment(user_id):
+    if is_admin(user_id):
+        return True, "Admin - Unlimited"
+    if is_user_premium(user_id):
+        return True, "Premium - Unlimited"
+    used_count = get_free_deployment_used_count(user_id)
+    remaining = FREE_USER_MAX_DEPLOYMENTS - used_count
+    if remaining > 0:
+        return True, f"Free tier - {remaining} remaining"
+    else:
+        return False, f"Free tier limit reached ({used_count}/{FREE_USER_MAX_DEPLOYMENTS})"
+
 # ========== CHANNEL VERIFICATION ==========
 def check_channel_membership(user_id) -> bool:
     channel = (REQUIRED_CHANNEL or '').strip()
@@ -928,16 +764,7 @@ def check_channel_membership(user_id) -> bool:
                 if any(kw in desc for kw in ('bot is not', 'not a member', 'need admin', 'rights', 'forbidden')):
                     return True
                 return False
-        except urllib.error.HTTPError as e:
-            body = ''
-            try: body = e.read().decode()[:200]
-            except Exception: pass
-            if e.code in (400, 403):
-                return True
-            if attempt < 2:
-                sleep(1)
-        except Exception as e:
-            print(f"⚠️ getChatMember attempt {attempt+1}: {e}")
+        except Exception:
             if attempt < 2:
                 sleep(1)
     return True
@@ -1046,7 +873,6 @@ def create_redeem_code(admin_id, coins_amount=0, stars_amount=0, expiry_days=30,
          expires_at.isoformat(), expiry_days, max_uses, 1))
     conn.commit()
     conn.close()
-    update_system_stats()
     return code
 
 def redeem_code(user_id, code):
@@ -1087,7 +913,6 @@ def redeem_code(user_id, code):
               (new_used_count, new_used_by, code_id))
     conn.commit()
     conn.close()
-    update_system_stats()
     return True, f"✅ Redeemed: {', '.join(reward_msg)}!"
 
 # ========== REFERRAL FUNCTIONS ==========
@@ -1140,6 +965,40 @@ def process_referral(referrer_id, new_user_id):
     conn2.close()
     return True
 
+def show_referral_menu(chat_id, user_id, message_id=None):
+    code = get_or_create_referral_code(user_id)
+    bot_username = get_bot_username()
+    ref_link = f"https://t.me/{bot_username}?start={code}" if bot_username else f"Your code: `{code}`"
+    
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*), COALESCE(SUM(reward_coins),0) FROM referrals WHERE referrer_id = ? AND reward_given = 1", (user_id,))
+    row = c.fetchone()
+    total_refs = row[0] or 0
+    total_earned = row[1] or 0
+    c.execute("SELECT referred_id, created_at FROM referrals WHERE referrer_id = ? ORDER BY created_at DESC LIMIT 5", (user_id,))
+    recent = c.fetchall()
+    conn.close()
+    
+    recent_text = ""
+    for rid, rat in recent:
+        dt = datetime.fromisoformat(rat).strftime("%d %b")
+        recent_text += f"  • User `{rid}` — {dt}\n"
+    
+    text = (f"*👥 REFERRAL PROGRAMME*\n\nInvite friends and earn *{REFERRAL_REWARD_COINS} 🪙* for every person who joins!\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n🔗 *Your referral link:*\n`{ref_link}`\n\n"
+            f"📊 *Your stats:*\n  👥 Total referrals: `{total_refs}`\n  🪙 Total earned:    `{total_earned}🪙`\n\n"
+            + (f"🕐 *Recent referrals:*\n{recent_text}\n" if recent_text else "")
+            + f"━━━━━━━━━━━━━━━━━━━━━━\nShare your link!")
+    keyboard = {"inline_keyboard": [
+        [{"text": "📤 Share Link", "switch_inline_query": f"Join this bot hosting platform! {ref_link}"}],
+        [{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]
+    ]}
+    if message_id:
+        edit_message(chat_id, message_id, text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
 # ========== BUG REPORT FUNCTIONS ==========
 def submit_bug_report(user_id, username, first_name, message_text):
     conn = sqlite3.connect(DATABASE_FILE)
@@ -1162,651 +1021,600 @@ def submit_bug_report(user_id, username, first_name, message_text):
         send_message(admin_id, admin_text, admin_kb)
     return report_id
 
-def reply_to_bug_report(report_id, admin_id, reply_text):
+# ========== USER STEP FUNCTIONS ==========
+def set_user_step(user_id, step, **kwargs):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
-    c.execute("SELECT user_id, username, first_name FROM bug_reports WHERE report_id = ?", (report_id,))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return False, "Report not found"
-    target_user_id, username, first_name = row
-    c.execute(
-        "UPDATE bug_reports SET status='replied', admin_reply=?, replied_by=?, replied_at=? "
-        "WHERE report_id = ?",
-        (reply_text, admin_id, datetime.now().isoformat(), report_id))
+    c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    _KNOWN = {'temp_file', 'requirements', 'env_vars', 'plan', 'payment_method',
+              'duration', 'cost_coins', 'cost_stars', 'waiting_for_env',
+              'waiting_for_reqs', 'waiting_for_redeem', 'temp_target_user',
+              'temp_coins_amount', 'temp_stars_amount', 'temp_expiry', 'temp_reward_type',
+              'temp_file_id', 'requirements_file_id'}
+    updates = ["step = ?"]
+    values = [step]
+    for key in _KNOWN:
+        if key in kwargs:
+            updates.append(f"{key} = ?")
+            val = kwargs[key]
+            if key == 'env_vars' and val is not None and not isinstance(val, str):
+                val = json.dumps(val)
+            values.append(val)
+    if step is None:
+        pending = json.dumps({})
+    else:
+        c.execute("SELECT pending_json FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        try:
+            existing = json.loads(row[0] or '{}') if row else {}
+        except Exception:
+            existing = {}
+        existing.update(kwargs)
+        existing['_step'] = step
+        pending = json.dumps(existing)
+    updates.append("pending_json = ?")
+    values.append(pending)
+    values.append(user_id)
+    c.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", values)
     conn.commit()
     conn.close()
-    send_message(target_user_id,
-        f"*✉️ REPLY TO YOUR BUG REPORT #{report_id}*\n\nAn admin has replied to your report:\n\n_{reply_text}_\n\nThank you! 🙏",
-        {"inline_keyboard": [[{"text": "🐛 Submit Another Report", "callback_data": "report_bug"}],
-                              [{"text": "🏠 Main Menu", "callback_data": "main_menu"}]]})
-    return True, target_user_id
 
-# ========== FRAMEWORK DETECTION ==========
-_PLATFORM_PATTERNS = {
-    'telegram_telebot': ['import telebot', 'from telebot', 'TeleBot('],
-    'telegram_aiogram': ['import aiogram', 'from aiogram', 'Dispatcher(', 'Router()'],
-    'telegram_ptb': ['from telegram', 'from telegram.ext', 'Application.builder', 'ApplicationBuilder'],
-    'telegram_pyrogram': ['import pyrogram', 'from pyrogram', 'Client('],
-    'telegram_telethon': ['import telethon', 'from telethon', 'TelegramClient('],
-    'whatsapp_pywa': ['import pywa', 'from pywa', 'WhatsApp('],
-    'whatsapp_heyoo': ['import heyoo', 'from heyoo', 'WhatsApp('],
-    'whatsapp_twilio': ['from twilio', 'import twilio', 'MessagingResponse('],
-    'whatsapp_cloud': ['WHATSAPP_TOKEN', 'PHONE_NUMBER_ID', 'graph.facebook.com', 'whatsapp/messages'],
-    'discord_py': ['import discord', 'from discord', 'discord.Client(', 'commands.Bot('],
-    'discord_nextcord': ['import nextcord', 'from nextcord'],
-    'discord_disnake': ['import disnake', 'from disnake'],
-    'discord_pycord': ['import py_cord', 'from py_cord'],
-    'slack': ['from slack_sdk', 'import slack_sdk', 'from slack_bolt', 'import slack_bolt', 'WebClient('],
-    'twitter': ['import tweepy', 'from tweepy', 'tweepy.Client', 'tweepy.API'],
-    'line': ['from linebot', 'import linebot', 'LineBotApi(', 'WebhookHandler('],
-    'viber': ['from viberbot', 'import viberbot', 'ViberApi('],
-    'matrix': ['from nio import', 'import nio', 'matrix_client', 'AsyncClient('],
-    'irc': ['import irc', 'from irc.bot', 'SingleServerIRCBot('],
-    'flask': ['from flask import', 'import flask', 'Flask(__name__)'],
-    'fastapi': ['from fastapi', 'import fastapi', 'FastAPI()'],
-    'django': ['import django', 'from django', 'DJANGO_SETTINGS'],
-    'aiohttp': ['import aiohttp', 'from aiohttp'],
-    'starlette': ['from starlette', 'import starlette'],
-}
-
-_PLATFORM_LABELS = {
-    'telegram_telebot': '📱 Telegram (pyTelegramBotAPI)',
-    'telegram_aiogram': '📱 Telegram (aiogram)',
-    'telegram_ptb': '📱 Telegram (python-telegram-bot)',
-    'telegram_pyrogram': '📱 Telegram (Pyrogram)',
-    'telegram_telethon': '📱 Telegram (Telethon)',
-    'whatsapp_pywa': '💬 WhatsApp (PyWA)',
-    'whatsapp_heyoo': '💬 WhatsApp (heyoo)',
-    'whatsapp_twilio': '💬 WhatsApp (Twilio)',
-    'whatsapp_cloud': '💬 WhatsApp (Cloud API)',
-    'discord_py': '🎮 Discord (discord.py)',
-    'discord_nextcord': '🎮 Discord (nextcord)',
-    'discord_disnake': '🎮 Discord (disnake)',
-    'discord_pycord': '🎮 Discord (py-cord)',
-    'slack': '💼 Slack',
-    'twitter': '🐦 Twitter/X (Tweepy)',
-    'line': '💚 Line',
-    'viber': '💜 Viber',
-    'matrix': '🔷 Matrix',
-    'irc': '📡 IRC',
-    'flask': '🌐 Flask',
-    'fastapi': '🌐 FastAPI',
-    'django': '🌐 Django',
-    'aiohttp': '🌐 aiohttp',
-    'starlette': '🌐 Starlette',
-}
-
-PLATFORM_ENV_HINTS = {
-    'telegram_telebot': '`BOT_TOKEN` — your Telegram bot token from @BotFather',
-    'telegram_aiogram': '`BOT_TOKEN` — your Telegram bot token from @BotFather',
-    'telegram_ptb': '`BOT_TOKEN` — your Telegram bot token from @BotFather',
-    'telegram_pyrogram': '`API_ID`, `API_HASH`, `BOT_TOKEN` — from my.telegram.org + @BotFather',
-    'telegram_telethon': '`API_ID`, `API_HASH` — from my.telegram.org',
-    'whatsapp_pywa': '`WHATSAPP_TOKEN`, `PHONE_NUMBER_ID` — from Meta Developer Portal',
-    'whatsapp_heyoo': '`WHATSAPP_TOKEN`, `PHONE_NUMBER_ID` — from Meta Developer Portal',
-    'whatsapp_twilio': '`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_NUMBER` — from Twilio Console',
-    'whatsapp_cloud': '`WHATSAPP_TOKEN`, `PHONE_NUMBER_ID`, `VERIFY_TOKEN` — from Meta Developer Portal',
-    'discord_py': '`DISCORD_TOKEN` — from Discord Developer Portal → Bot → Token',
-    'discord_nextcord': '`DISCORD_TOKEN` — from Discord Developer Portal → Bot → Token',
-    'discord_disnake': '`DISCORD_TOKEN` — from Discord Developer Portal → Bot → Token',
-    'discord_pycord': '`DISCORD_TOKEN` — from Discord Developer Portal → Bot → Token',
-    'slack': '`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET` — from api.slack.com',
-    'twitter': '`TWITTER_API_KEY`, `TWITTER_API_SECRET`, `TWITTER_BEARER_TOKEN` — from developer.twitter.com',
-    'line': '`LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET` — from Line Developer Console',
-    'viber': '`VIBER_AUTH_TOKEN` — from Viber Admin Panel',
-    'matrix': '`MATRIX_HOMESERVER`, `MATRIX_USER`, `MATRIX_PASSWORD` — from your Matrix server',
-    'irc': '`IRC_SERVER`, `IRC_PORT`, `IRC_NICK`, `IRC_CHANNEL`',
-    'flask': '`PORT` (optional, default 5000)',
-    'fastapi': '`PORT` (optional, default 8000)',
-    'django': '`SECRET_KEY`, `DEBUG`, `ALLOWED_HOSTS`',
-}
-
-def detect_bot_framework(code_content: str) -> list:
-    detected = []
-    code_lower = code_content.lower()
-    for platform, patterns in _PLATFORM_PATTERNS.items():
-        for pattern in patterns:
-            if pattern.lower() in code_lower:
-                detected.append(platform)
-                break
-    seen = set()
-    result = []
-    for p in detected:
-        if p not in seen:
-            seen.add(p)
-            result.append(p)
-    return result if result else ['generic']
-
-def get_platform_label(frameworks: list) -> str:
-    labels = [_PLATFORM_LABELS.get(fw, fw.replace('_', ' ').title())
-              for fw in frameworks if fw != 'generic']
-    return ', '.join(labels) if labels else '🤖 Generic Python Bot'
-
-def get_platform_env_hint(frameworks: list) -> str:
-    hints = []
-    for fw in frameworks:
-        hint = PLATFORM_ENV_HINTS.get(fw)
-        if hint and hint not in hints:
-            label = _PLATFORM_LABELS.get(fw, fw)
-            hints.append(f"*{label}:*\n{hint}")
-    return '\n\n'.join(hints) if hints else ''
-
-# ========== DEPENDENCY INSTALLER ==========
-def install_dependencies_enhanced(reqs_file, update_logs, packages_dir=None):
-    if not reqs_file.exists():
-        update_logs("✅ No requirements file found")
-        return True, []
+def get_user_step(user_id):
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("""SELECT step, temp_file, requirements, env_vars, plan, payment_method,
+                        duration, cost_coins, cost_stars, waiting_for_env,
+                        waiting_for_reqs, waiting_for_redeem, temp_target_user,
+                        temp_coins_amount, temp_stars_amount, temp_expiry,
+                        temp_reward_type, pending_json
+                 FROM users WHERE user_id = ?""", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    _DEFAULTS = {
+        'step': None, 'temp_file': None, 'requirements': None, 'env_vars': {},
+        'plan': None, 'payment_method': None, 'duration': None,
+        'cost_coins': None, 'cost_stars': None,
+        'waiting_for_env': 0, 'waiting_for_reqs': 0, 'waiting_for_redeem': 0,
+        'temp_target_user': None, 'temp_coins_amount': None,
+        'temp_stars_amount': None, 'temp_expiry': None, 'temp_reward_type': None,
+        'temp_file_id': None, 'requirements_file_id': None,
+    }
+    if not row:
+        return _DEFAULTS.copy()
     try:
-        with open(reqs_file, 'r') as f:
-            raw = f.read().strip()
-        if not raw:
-            update_logs("⚠️ requirements.txt is empty")
-            return True, []
-        packages = [p.strip() for p in raw.split('\n')
-                    if p.strip() and not p.startswith('#') and not p.startswith('-')]
-        update_logs(f"📦 {len(packages)} package(s) to install")
-        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
-                       capture_output=True, timeout=60)
-        
-        def _pip_cmd(pkg_or_flag, extra_flags=None):
-            cmd = [sys.executable, "-m", "pip", "install", "--upgrade",
-                   "--no-warn-script-location", "--quiet"]
-            if packages_dir:
-                cmd += ["--target", str(packages_dir)]
-            if extra_flags:
-                cmd += extra_flags
-            cmd.append(pkg_or_flag)
-            return cmd
-        
-        success_count = 0
-        failed_packages = []
-        for i, package in enumerate(packages):
-            update_logs(f"   ⬇️  {package[:60]}")
-            cmd = _pip_cmd(package)
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-            if res.returncode == 0:
-                success_count += 1
-                update_logs(f"   ✅ {package[:60]}")
-            else:
-                res2 = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "--quiet", "--force-reinstall",
-                     *(["--target", str(packages_dir)] if packages_dir else []),
-                     package],
-                    capture_output=True, text=True, timeout=180)
-                if res2.returncode == 0:
-                    success_count += 1
-                    update_logs(f"   ✅ {package[:60]} (retry OK)")
-                else:
-                    failed_packages.append(package)
-                    err_line = (res.stderr or res.stdout or "")[-200:].strip().split('\n')[-1]
-                    update_logs(f"   ❌ {package[:50]}: {err_line[:80]}")
-        if failed_packages:
-            update_logs(f"⚠️ Failed ({len(failed_packages)}): {', '.join(p.split('==')[0][:20] for p in failed_packages[:5])}")
-        update_logs(f"✅ {success_count}/{len(packages)} packages installed")
-        return (success_count / len(packages)) >= 0.7 if packages else True, failed_packages
-    except Exception as e:
-        update_logs(f"❌ Installer error: {e}")
-        return False, []
+        pj = json.loads(row[17] or '{}')
+    except Exception:
+        pj = {}
+    result = {**_DEFAULTS, **pj}
+    col_map = ['step','temp_file','requirements','env_vars','plan','payment_method',
+               'duration','cost_coins','cost_stars','waiting_for_env','waiting_for_reqs',
+               'waiting_for_redeem','temp_target_user','temp_coins_amount',
+               'temp_stars_amount','temp_expiry','temp_reward_type']
+    for i, key in enumerate(col_map):
+        val = row[i]
+        if val is None:
+            continue
+        if key == 'env_vars':
+            try:
+                val = json.loads(val)
+            except Exception:
+                val = {}
+        elif key in ('waiting_for_env','waiting_for_reqs','waiting_for_redeem'):
+            val = int(val or 0)
+        result[key] = val
+    return result
 
-def install_from_repo_requirements(deploy_folder: Path, update_logs) -> list:
-    packages_dir = deploy_folder / 'packages'
-    packages_dir.mkdir(exist_ok=True)
-    installed = []
-    for fname in ['requirements.txt', 'requirements-dev.txt', 'requirements_prod.txt',
-                  'requirements/base.txt', 'requirements/main.txt']:
-        req_path = deploy_folder / fname
-        if req_path.exists():
-            update_logs(f"📋 Found {fname}")
-            ok, failed = install_dependencies_enhanced(req_path, update_logs, packages_dir)
-            installed.extend([l.strip() for l in req_path.read_text().splitlines()
-                              if l.strip() and not l.startswith('#')])
-    return installed
-
-# ========== LAUNCHER CREATION ==========
-def create_enhanced_launcher_script(deploy_folder, dest_script, env_vars_dict, code_content, update_logs, packages_dir=None):
-    frameworks = detect_bot_framework(code_content)
-    framework_str = ', '.join(frameworks)
-    update_logs(f"🔧 Framework detection: {framework_str}")
-    launcher_script = deploy_folder / "run.py"
-    env_set_code = []
-    for k, v in env_vars_dict.items():
-        env_set_code.append(f'os.environ[{k!r}] = {v!r}')
-    env_set_str = "\n".join(env_set_code) if env_set_code else "# No custom environment variables"
-    packages_dir_str = str(packages_dir) if packages_dir else str(deploy_folder / 'packages')
-    with open(launcher_script, 'w', encoding='utf-8') as f:
-        f.write(f'''#!/usr/bin/env python3
-"""
-UNIVERSAL BOT LAUNCHER - Detected frameworks: {framework_str}
-"""
-import os, sys, time, json, signal, threading, traceback
-from pathlib import Path
-_pkg_dir = r"{packages_dir_str}"
-if os.path.isdir(_pkg_dir) and _pkg_dir not in sys.path:
-    sys.path.insert(0, _pkg_dir)
-os.chdir(r"{deploy_folder}")
-_HOSTING_BOT_KEYS = {{
-    'BOT_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_BOT_TOKEN',
-    'TOKEN', 'API_TOKEN', 'TG_BOT_TOKEN', 'TGBOT_TOKEN',
-    'DISCORD_TOKEN', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',
-    'GITHUB_TOKEN', 'GITHUB_REPO_OWNER', 'GITHUB_REPO_NAME',
-    'GITHUB_BACKUP_BRANCH', 'GITHUB_BACKUP_PATH',
-    'DATABASE_URL', 'DATABASE_FILE',
-    'ADMIN_IDS', 'REQUIRED_CHANNEL', 'CHANNEL_LINK',
-}}
-for _hk in _HOSTING_BOT_KEYS:
-    os.environ.pop(_hk, None)
-{env_set_str}
-try:
-    from dotenv import load_dotenv
-    env_file = Path(r"{deploy_folder}") / ".env"
-    if env_file.exists():
-        load_dotenv(env_file, override=False)
-except ImportError:
-    pass
-except Exception:
-    pass
-heartbeat_running = True
-def heartbeat():
-    heartbeat_file = Path(r"{deploy_folder}") / ".heartbeat"
-    while heartbeat_running:
-        try:
-            with open(heartbeat_file, 'w') as f:
-                f.write(str(time.time()))
-            time.sleep(30)
-        except:
-            pass
-threading.Thread(target=heartbeat, daemon=True).start()
-print("=" * 50)
-print("🔧 LAUNCHER READY")
-print("=" * 50)
-print(f"Python: {{sys.version.split()[0]}}")
-print(f"Dir: {{os.getcwd()}}")
-sys.stdout.flush()
-_SKIP_PREFIXES = ('KUBERNETES_', 'RENDER_', 'UV_', 'PIPENV_', 'NPM_', 'NODE_',
-                   'BUN_', 'GUNICORN_', 'YARN_', 'DEFAULT_', 'PYTHON_')
-_SKIP_EXACT = frozenset([
-    'PATH', 'PYTHONPATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM',
-    'LANG', 'LC_ALL', 'PWD', 'HOSTNAME', 'RENDER', 'PORT',
-    'IS_PULL_REQUEST', 'RENDER_ROOT', 'RENDER_ENV_IS_DOCKER',
-    'RENDER_SERVICE_ID', 'RENDER_SERVICE_NS', 'RENDER_SERVICE_CONTEXT_ROOT',
-    'RENDER_EXTERNAL_HOSTNAME', 'RENDER_GIT_REPO_SLUG',
-    'RENDER_NODE_VERSION_DETECTED', 'RENDER_NODE_INSTALLED',
-    'RENDER_PRE_RUN_COMMAND', 'RENDER_CPU_COUNT', 'USER_RUN_COMMAND',
-    'BLACK', 'BLUE', 'CYAN', 'YELLOW', 'RESET', 'ENTER_STANDOUT',
-    'PYTHONUNBUFFERED', 'UV_COMPILE_BYTECODE', 'ENTER_BOLD',
-])
-_shown_keys = []
-for _k, _v in os.environ.items():
-    if _k in _SKIP_EXACT:
-        continue
-    _skip = False
-    for _pfx in _SKIP_PREFIXES:
-        if _k.startswith(_pfx):
-            _skip = True
-            break
-    if _skip:
-        continue
-    _shown_keys.append(_k)
-    if any(_s in _k.upper() for _s in ['TOKEN', 'SECRET', 'KEY', 'PASSWORD', 'HASH']):
-        _disp = (_v[:8] + '...') if len(_v) > 8 else '***'
-    else:
-        _disp = (_v[:60] + '...') if len(_v) > 60 else _v
-    print(f"  ✅ {{_k}} = {{_disp}}")
-if not _shown_keys:
-    print("  ℹ️  No custom env vars")
-sys.stdout.flush()
-print("=" * 50)
-print("🚀 STARTING BOT")
-print("=" * 50)
-sys.stdout.flush()
-_TOKEN_ALIASES = ['BOT_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_BOT_TOKEN',
-                  'TOKEN', 'API_TOKEN', 'TG_BOT_TOKEN', 'TGBOT_TOKEN',
-                  'DISCORD_TOKEN']
-_found_token = None
-for _alias in _TOKEN_ALIASES:
-    _t = os.environ.get(_alias, '')
-    if _t:
-        _found_token = _t
-        break
-if _found_token:
-    for _alias in _TOKEN_ALIASES:
-        if not os.environ.get(_alias):
-            os.environ[_alias] = _found_token
-    print("✅ Token env vars bridged")
-else:
-    print("⚠️  No bot token found — set BOT_TOKEN or TELEGRAM_TOKEN in env vars")
-# Method 1: Import and run
-try:
-    print("📌 Method 1: Importing as module...")
-    sys.stdout.flush()
-    sys.path.insert(0, r"{deploy_folder}")
-    import importlib.util, inspect as _inspect, socket as _socket, threading as _thr
-    spec = importlib.util.spec_from_file_location("user_bot", r"{dest_script}")
-    if spec is None:
-        raise ImportError(f"Cannot load module from {dest_script}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["user_bot"] = module
-    _webhook_patches = []
+# ========== KILL PROCESS ==========
+def kill_deployment_process(pid, sig=None):
+    if sig is None:
+        sig = signal.SIGTERM
+    if not pid:
+        return
     try:
-        import telebot as _tb_mod
-        _orig_sw = _tb_mod.TeleBot.set_webhook
-        def _noop_set_webhook(self, *a, **kw):
-            print("  ℹ️  [launcher] set_webhook() suppressed")
-        _tb_mod.TeleBot.set_webhook = _noop_set_webhook
-        _webhook_patches.append((_tb_mod.TeleBot, 'set_webhook', _orig_sw))
-    except ImportError:
+        target_pgid = os.getpgid(pid)
+        own_pgid = os.getpgid(os.getpid())
+        if target_pgid == own_pgid:
+            os.kill(pid, sig)
+            return
+        os.killpg(target_pgid, sig)
+    except (ProcessLookupError, PermissionError):
         pass
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        for _obj, _attr, _orig in _webhook_patches:
-            setattr(_obj, _attr, _orig)
-    print("✅ Module loaded successfully")
-    sys.stdout.flush()
-    def _free_port():
-        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
-            _s.bind(('', 0))
-            return _s.getsockname()[1]
-    def _module_has_telegram_bot():
-        _poll_methods = ('polling', 'run_polling', 'start_polling', 'infinity_polling')
+    except Exception:
         try:
-            _names = list(vars(module).keys())
+            os.kill(pid, sig)
         except Exception:
-            _names = []
-        for _n in _names:
-            if _n.startswith('__'):
-                continue
-            try:
-                _obj = getattr(module, _n, None)
-            except Exception:
-                continue
-            if _obj is None or _obj is module:
-                continue
-            if type(_obj).__name__ == 'LocalProxy':
-                continue
-            try:
-                if any(callable(getattr(_obj, _m, None)) for _m in _poll_methods):
-                    return True
-            except Exception:
-                continue
-        return False
-    def _clear_webhook(bot_obj, label='bot'):
-        import time as _time, asyncio as _aio, inspect as _inspect
-        def _resolve(value):
-            if _inspect.iscoroutine(value):
-                return _aio.run(value)
-            return value
-        try:
-            get_info = getattr(bot_obj, 'get_webhook_info', None)
-            if callable(get_info):
-                _wh = _resolve(get_info())
-                _url = getattr(_wh, 'url', '') or ''
-                if _url:
-                    print(f"  ⚠️ Active webhook on {{label}}: {{_url[:60]}}...")
-                    remove_fn = (getattr(bot_obj, 'remove_webhook', None) or
-                                 getattr(bot_obj, 'delete_webhook', None))
-                    if callable(remove_fn):
-                        _resolve(remove_fn())
-                    _time.sleep(1)
-                    print(f"  ✅ Webhook removed")
-                else:
-                    print(f"  ✅ No webhook set on {{label}}")
-            elif hasattr(bot_obj, 'bot') and callable(getattr(bot_obj.bot, 'get_webhook_info', None)):
-                _clear_webhook(bot_obj.bot, label + '.bot')
-        except Exception as _we:
-            print(f"  ⚠️ Could not check/remove webhook ({{_we}})")
-    def _make_runner(name, obj):
-        _cls = type(obj).__name__.lower()
-        _cls_mod = (getattr(type(obj), '__module__', '') or '').lower()
-        if callable(getattr(obj, 'polling', None)) and callable(getattr(obj, 'stop_polling', None)):
-            print(f"  📱 {{name}} → Telegram (pyTelegramBotAPI) → polling")
-            def _run_telebot(_b=obj, _n=name):
-                _clear_webhook(_b, _n)
-                _b.polling(non_stop=True, timeout=60, long_polling_timeout=60)
-            return _run_telebot
-        if hasattr(obj, 'run_polling') and hasattr(obj, 'run_webhook'):
-            print(f"  📱 {{name}} → Telegram (aiogram) → run_polling")
-            def _run_aiogram(_a=obj, _n=name):
-                _clear_webhook(_a, _n)
-                _a.run_polling()
-            return _run_aiogram
-        if hasattr(obj, 'run_polling') and hasattr(obj, 'initialize'):
-            print(f"  📱 {{name}} → Telegram (PTB) → run_polling")
-            def _run_ptb(_a=obj, _n=name):
-                _clear_webhook(_a, _n)
-                _a.run_polling()
-            return _run_ptb
-        if callable(getattr(obj, 'run_polling', None)):
-            print(f"  📱 {{name}} → has run_polling()")
-            def _run_genpoll(_a=obj, _n=name):
-                _clear_webhook(_a, _n)
-                _a.run_polling()
-            return _run_genpoll
-        if _cls in ('client',) and 'pyrogram' in _cls_mod:
-            print(f"  📱 {{name}} → Telegram (Pyrogram) → run")
-            return lambda: obj.run()
-        if 'telethon' in _cls_mod and hasattr(obj, 'run_until_disconnected'):
-            print(f"  📱 {{name}} → Telegram (Telethon)")
-            return lambda: obj.run_until_disconnected()
-        if 'pywa' in _cls_mod or (hasattr(obj, 'run_forever') and 'whatsapp' in str(type(obj)).lower()):
-            print(f"  💬 {{name}} → WhatsApp (PyWA) → run_forever")
-            return lambda: obj.run_forever()
-        _is_discord = ('discord' in _cls_mod or 'nextcord' in _cls_mod
-                       or 'disnake' in _cls_mod or 'py_cord' in _cls_mod
-                       or 'pycord' in _cls_mod)
-        if _is_discord and callable(getattr(obj, 'run', None)):
-            _tok = (os.environ.get('DISCORD_TOKEN') or os.environ.get('TOKEN') or os.environ.get('BOT_TOKEN', ''))
-            if _tok:
-                print(f"  🎮 {{name}} → Discord → .run(token)")
-                return lambda: obj.run(_tok)
-            print(f"  ⚠️ Discord object found but no DISCORD_TOKEN env var set")
-        if 'slack' in _cls_mod and callable(getattr(obj, 'start', None)):
-            _port = int(os.environ.get('PORT', _free_port()))
-            print(f"  💼 {{name}} → Slack Bolt → .start(port={{_port}})")
-            return lambda: obj.start(port=_port)
-        if 'tweepy' in _cls_mod:
-            if callable(getattr(obj, 'filter', None)):
-                print(f"  🐦 {{name}} → Twitter/X (Tweepy Stream) → .filter()")
-                return lambda: obj.filter()
-            if callable(getattr(obj, 'sample', None)):
-                print(f"  🐦 {{name}} → Twitter/X (Tweepy) → .sample()")
-                return lambda: obj.sample()
-        if 'nio' in _cls_mod and callable(getattr(obj, 'sync_forever', None)):
-            print(f"  🔷 {{name}} → Matrix (nio) → sync_forever")
-            return lambda: obj.sync_forever()
-        if 'irc' in _cls_mod and callable(getattr(obj, 'start', None)):
-            print(f"  📡 {{name}} → IRC → .start()")
-            return lambda: obj.start()
-        if _cls in ('flask', 'quart') or 'flask' in _cls_mod or 'quart' in _cls_mod:
-            if _module_has_telegram_bot():
-                _port = _free_port()
-                print(f"  🌐 {{name}} → Flask keep-alive thread (port {{_port}})")
-                def _flask_bg(_app=obj, _p=_port):
-                    try:
-                        _app.run(host='0.0.0.0', port=_p, debug=False, use_reloader=False)
-                    except Exception as _fe:
-                        print(f"  ⚠️ Flask keep-alive: {{_fe}}")
-                _thr.Thread(target=_flask_bg, daemon=True, name='FlaskKeepAlive').start()
-                return 'BACKGROUND'
-            else:
-                _port = int(os.environ.get('PORT', os.environ.get('BOT_PORT', 0)) or _free_port())
-                print(f"  🌐 {{name}} → Flask/Quart → .run(port={{_port}})")
-                return lambda: obj.run(host='0.0.0.0', port=_port, debug=False, use_reloader=False)
-        if _cls in ('fastapi', 'starlette') or 'fastapi' in _cls_mod or 'starlette' in _cls_mod:
-            _port = int(os.environ.get('PORT', _free_port()))
-            print(f"  🌐 {{name}} → FastAPI/Starlette → uvicorn (port={{_port}})")
-            def _run_asgi():
-                try:
-                    import uvicorn
-                    uvicorn.run(obj, host='0.0.0.0', port=_port, log_level='info')
-                except ImportError:
-                    try:
-                        import asyncio, hypercorn.asyncio as _ha, hypercorn.config as _hc
-                        _cfg = _hc.Config(); _cfg.bind = [f'0.0.0.0:{{_port}}']
-                        asyncio.run(_ha.serve(obj, _cfg))
-                    except ImportError:
-                        print("❌ uvicorn/hypercorn not found — add uvicorn to requirements.txt")
-                        sys.exit(1)
-            return _run_asgi
-        if 'django' in _cls_mod:
-            _port = int(os.environ.get('PORT', _free_port()))
-            print(f"  🌐 {{name}} → Django → runserver port {{_port}}")
-            import subprocess as _sp
-            return lambda: _sp.run([sys.executable, 'manage.py', 'runserver',
-                                     f'0.0.0.0:{{_port}}', '--noreload'],
-                                    cwd=str(os.getcwd()))
-        if _inspect.iscoroutinefunction(obj):
-            import asyncio as _aio
-            print(f"  ⚡ {{name}} → async function → asyncio.run")
-            return lambda: _aio.run(obj())
-        if _inspect.isfunction(obj) or _inspect.isbuiltin(obj) or _inspect.ismethod(obj):
-            return None
-        if callable(getattr(obj, 'run', None)):
-            print(f"  ▶️  {{name}} → has .run()")
-            return lambda: obj.run()
-        if callable(obj):
-            return None
-        return None
-    entry_points = ['main', 'run', 'start', 'bot', 'dp', 'dispatcher',
-                    'updater', 'setup', 'client', 'app', 'application']
-    for entry in entry_points:
-        if not hasattr(module, entry):
-            continue
-        attr = getattr(module, entry)
-        if not callable(attr):
-            continue
-        print(f"✅ Entry point: {{entry}}")
-        sys.stdout.flush()
-        runner = _make_runner(entry, attr)
-        if runner == 'BACKGROUND':
-            continue
-        try:
-            if runner is not None:
-                runner()
-            else:
-                result = attr()
-                if result is not None:
-                    sub = _make_runner(f"{{entry}}() result", result)
-                    if sub and sub != 'BACKGROUND':
-                        sub()
-                    elif callable(getattr(result, 'polling', None)):
-                        result.polling(non_stop=True, timeout=60)
-                    elif callable(getattr(result, 'run_polling', None)):
-                        result.run_polling()
-                    elif callable(getattr(result, 'run', None)):
-                        result.run()
-                    elif callable(getattr(result, 'run_forever', None)):
-                        result.run_forever()
-                    elif callable(getattr(result, 'serve_forever', None)):
-                        result.serve_forever()
-        except KeyboardInterrupt:
-            print("\\n🛑 Bot stopped by user")
-        except SystemExit as _se:
-            sys.exit(_se.code)
-        except Exception as _err:
-            print(f"❌ Error in {{entry}}: {{type(_err).__name__}}: {{_err}}")
-            traceback.print_exc()
-            sys.stdout.flush()
-            heartbeat_running = False
-            sys.exit(1)
-        heartbeat_running = False
-        sys.exit(0)
-    print("⚠️ No recognised entry point — falling through to Method 2...")
-    sys.stdout.flush()
-except Exception as e:
-    print(f"⚠️ Import method failed: {{type(e).__name__}}: {{e}}")
-    traceback.print_exc()
-    sys.stdout.flush()
-# Method 2: Subprocess
-print("📌 Method 2: Running as subprocess...")
-sys.stdout.flush()
-import subprocess
-try:
-    _child_env = os.environ.copy()
-    if os.path.isdir(_pkg_dir):
-        _existing_pp = _child_env.get('PYTHONPATH', '')
-        _child_env['PYTHONPATH'] = _pkg_dir + (os.pathsep + _existing_pp if _existing_pp else '')
-    result = subprocess.run([sys.executable, r"{dest_script}"], env=_child_env)
-    sys.exit(result.returncode)
-except KeyboardInterrupt:
-    print("\\n🛑 Stopped by user")
-    sys.exit(0)
-except Exception as e:
-    print(f"❌ Subprocess failed: {{e}}")
-    sys.exit(1)
-''')
-    launcher_script.chmod(0o755)
-    return launcher_script, frameworks
+            pass
 
-def create_node_launcher_script(deploy_folder: Path, dest_script: Path,
-                                env_vars_dict: dict, update_logs) -> tuple:
-    ext = dest_script.suffix.lower()
-    if ext in ('.ts', '.tsx'):
-        run_cmd = (f'if command -v npx &>/dev/null; then\n'
-                   f'    setsid npx --yes tsx "{dest_script}" >> output.log 2>&1 &\n'
-                   f'elif command -v ts-node &>/dev/null; then\n'
-                   f'    setsid ts-node "{dest_script}" >> output.log 2>&1 &\n'
-                   f'else\n'
-                   f'    echo "❌ No TypeScript runner found" >> output.log\n'
-                   f'    exit 1\n'
-                   f'fi')
-        framework = ['typescript']
-    elif ext in ('.mjs',):
-        run_cmd = f'setsid node --input-type=module "{dest_script}" >> output.log 2>&1 &'
-        framework = ['node_esm']
-    else:
-        run_cmd = f'setsid node "{dest_script}" >> output.log 2>&1 &'
-        framework = ['node']
+def get_deploy_folder(user_id, deployment_id):
     try:
-        code = dest_script.read_text(errors='ignore')
-        if 'discord' in code.lower():
-            framework.append('discord_js')
-        if 'telegraf' in code.lower() or 'node-telegram' in code.lower():
-            framework.append('telegram_node')
-        if 'whatsapp' in code.lower() or 'baileys' in code.lower():
-            framework.append('whatsapp_node')
-        if 'express' in code.lower() or 'fastify' in code.lower():
-            framework.append('web_server')
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute("SELECT folder_name, user_id FROM deployments WHERE deployment_id = ?", (deployment_id,))
+        row = c.fetchone()
+        conn.close()
+        if row and row[0]:
+            owner_id = row[1] if row[1] else user_id
+            return DEPLOYMENTS_DIR / str(owner_id) / str(row[0])
     except Exception:
         pass
-    env_file = deploy_folder / '.env'
-    env_file.write_text('\n'.join(f'{k}={v}' for k, v in env_vars_dict.items()) + '\n')
-    def _sh_quote(value):
-        return "'" + str(value).replace("'", "'\\''") + "'"
-    env_lines = '\n'.join(f'export {k}={_sh_quote(v)}' for k, v in env_vars_dict.items())
-    npm_install = ('if [ -f "package.json" ]; then\n'
-                   '    echo "📦 Installing npm packages..." >> output.log\n'
-                   '    npm install --no-audit --no-fund >> output.log 2>&1\n'
-                   'fi')
-    start_content = (f'#!/bin/bash\n'
-                     f'cd "{deploy_folder}"\n'
-                     f'export PYTHONUNBUFFERED=1\n'
-                     f'{env_lines}\n\n'
-                     f'{npm_install}\n\n'
-                     f'{run_cmd}\n'
-                     f'echo $! > pid.txt\n')
-    start_script = deploy_folder / 'start.sh'
-    start_script.write_text(start_content)
-    start_script.chmod(0o755)
-    update_logs(f"🟨 Node.js launcher created ({', '.join(framework)})")
-    return start_script, framework
+    return DEPLOYMENTS_DIR / str(user_id) / str(deployment_id)
 
-def _find_available_port(preferred: int = 20000) -> int:
-    import socket, random
-    candidates = [preferred] + random.sample(
-        range(max(20000, preferred - 500), min(39999, preferred + 500)), 40
-    )
-    for port in candidates:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+# ========== FULL CALLBACK HANDLER ==========
+def handle_callback(callback):
+    callback_id = callback['id']
+    user_id = callback['from']['id']
+    message = callback.get('message', {})
+    chat_id = message.get('chat', {}).get('id')
+    message_id = message.get('message_id')
+    data = callback['data']
+    
+    answer_callback(callback_id)
+    print(f"📨 Callback: {data} from user {user_id}")
+    
+    # ========== MAIN MENU ==========
+    if data == "main_menu":
+        if is_user_verified(user_id):
+            balances = get_user_balances(user_id)
+            welcome = f"*🤖 BOT HOSTING*\n\n🪙 `{balances['coins']}` | ⭐ `{balances['stars']}`\n\nChoose:"
+            edit_message(chat_id, message_id, welcome, get_main_menu(user_id))
+        else:
+            user_info = get_user_info(user_id)
+            send_verification_required(chat_id, user_id, user_info.get('first_name', 'User'), message_id)
+        return
+    
+    # ========== ADMIN PANEL ==========
+    if data == "admin_panel":
+        if is_admin(user_id):
+            show_admin_panel(chat_id, message_id)
+        else:
+            edit_message(chat_id, message_id, "🔒 Unauthorized!")
+        return
+    
+    # ========== REFERRALS ==========
+    if data == "my_referral":
+        show_referral_menu(chat_id, user_id, message_id)
+        return
+    
+    # ========== PREMIUM SUBSCRIPTION ==========
+    if data == "subscribe_premium":
+        show_premium_menu(chat_id, user_id, message_id)
+        return
+    
+    # ========== GITHUB DEPLOYMENT ==========
+    if data == "github_deploy":
+        if not is_user_verified(user_id):
+            send_verification_required(chat_id, user_id, "User", message_id)
+            return
+        set_user_step(user_id, 'awaiting_github_url')
+        edit_message(chat_id, message_id,
+            "*🐙 DEPLOY FROM GITHUB*\n\nSend me the GitHub repository URL or shorthand:\n\n"
+            "*Examples:*\n"
+            "`https://github.com/owner/repo`\n"
+            "`owner/repo`\n"
+            "`owner/repo@branch` ← specific branch\n\n"
+            "Supports *public and private* repos.",
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+        return
+    
+    # ========== CHANNEL VERIFICATION ==========
+    if data == "check_verification":
+        if check_channel_membership(user_id):
+            mark_channel_joined(user_id)
+            if not has_accepted_tos(user_id):
+                show_tos_prompt(chat_id, user_id, message_id)
+                return
+            balances = get_user_balances(user_id)
+            edit_message(chat_id, message_id,
+                f"✅ *VERIFIED!*\n\n🪙 {balances['coins']} | ⭐ {balances['stars']}\n\nWelcome!",
+                get_main_menu(user_id))
+        else:
+            send_verification_required(chat_id, user_id, "User", message_id)
+        return
+    
+    if data == "verify_channel":
+        if check_channel_membership(user_id):
+            mark_channel_joined(user_id)
+            if not has_accepted_tos(user_id):
+                show_tos_prompt(chat_id, user_id, message_id)
+                return
+            balances = get_user_balances(user_id)
+            edit_message(chat_id, message_id,
+                f"✅ *VERIFIED!*\n\nThank you for joining {REQUIRED_CHANNEL}!",
+                get_main_menu(user_id))
+        else:
+            edit_message(chat_id, message_id,
+                f"❌ *NOT VERIFIED*\n\nPlease join {REQUIRED_CHANNEL} first.",
+                {"inline_keyboard": [[{"text": "📢 JOIN", "url": CHANNEL_LINK},
+                                      {"text": "✅ VERIFY", "callback_data": "verify_channel"}]]})
+        return
+    
+    # ========== TERMS OF SERVICE ==========
+    if data == "tos_agree":
+        mark_tos_accepted(user_id)
+        balances = get_user_balances(user_id)
+        edit_message(chat_id, message_id,
+            f"✅ *Thanks for confirming!*\n\n🪙 {balances['coins']} | ⭐ {balances['stars']}\n\nWelcome!",
+            get_main_menu(user_id))
+        return
+    
+    # ========== MY BALANCE ==========
+    if data == "my_balance":
+        balances = get_user_balances(user_id)
+        is_premium = is_user_premium(user_id)
+        used_free = get_free_deployment_used_count(user_id)
+        free_remaining = FREE_USER_MAX_DEPLOYMENTS - used_free
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute("SELECT total_coins_earned, total_coins_spent, total_stars_earned, total_stars_spent FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        text = (f"*💰 YOUR BALANCE*\n\n🪙 Coins: `{balances['coins']}`\n⭐ Stars: `{balances['stars']}`\n"
+                f"🎫 Status: {'⭐ PREMIUM' if is_premium else '🆓 FREE'}\n"
+                f"🆓 Free Slots: `{free_remaining}/{FREE_USER_MAX_DEPLOYMENTS}`\n"
+                f"🪙 Earned: `{row[0] if row else 0}`\n🪙 Spent: `{row[1] if row else 0}`\n"
+                f"⭐ Earned: `{row[2] if row else 0}`\n⭐ Spent: `{row[3] if row else 0}`")
+        edit_message(chat_id, message_id, text,
+                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]})
+        return
+    
+    # ========== REDEEM CODE ==========
+    if data == "redeem_code":
+        set_user_step(user_id, 'awaiting_redeem', waiting_for_redeem=1)
+        send_message(chat_id, f"*🎫 REDEEM CODE*\n\nSend your code:",
+                    {"inline_keyboard": [[{"text": "🔙 Cancel", "callback_data": "main_menu"}]]})
+        return
+    
+    # ========== DEPLOY NEW ==========
+    if data == "deploy_new":
+        if not is_user_verified(user_id):
+            send_verification_required(chat_id, user_id, "User", message_id)
+            return
+        edit_message(chat_id, message_id, "*💰 DEPLOYMENT OPTIONS*\n\nChoose your plan:",
+                    get_deploy_menu(user_id))
+        return
+    
+    if data == "plan_monthly":
+        handle_paid_deployment(chat_id, user_id, message_id, "monthly", 30, PRICE_MONTHLY_COINS, PRICE_MONTHLY_STARS)
+        return
+    
+    if data == "plan_yearly":
+        handle_paid_deployment(chat_id, user_id, message_id, "yearly", 365, PRICE_YEARLY_COINS, PRICE_YEARLY_STARS)
+        return
+    
+    if data == "plan_lifetime":
+        if not is_admin(user_id):
+            answer_callback(callback_id, "⛔ Admins only", show_alert=True)
+            return
+        handle_paid_deployment(chat_id, user_id, message_id, "lifetime", 0, 0, 0)
+        return
+    
+    # ========== FREE DEPLOYMENT ==========
+    if data == "free_deployment":
+        handle_free_deployment(chat_id, user_id, message_id)
+        return
+    
+    # ========== MY DEPLOYMENTS ==========
+    if data == "my_deployments":
+        handle_deployments_list(chat_id, user_id, message_id)
+        return
+    
+    if data.startswith("view_deploy_"):
+        dep_id = int(data.split("_")[2])
+        view_deployment(chat_id, message_id, user_id, dep_id)
+        return
+    
+    if data.startswith("restart_deploy_"):
+        dep_id = int(data.split("_")[2])
+        send_message(chat_id, f"🔄 Restarting deployment #{dep_id}...")
+        success = restart_deployment_by_id(dep_id, user_id, is_auto_restart=False)
+        if success:
+            send_message(chat_id, f"✅ Deployment #{dep_id} restarted successfully!")
+        else:
+            send_message(chat_id, f"❌ Failed to restart deployment #{dep_id}")
+        return
+    
+    if data.startswith("delete_deploy_"):
+        dep_id = int(data.split("_")[2])
+        keyboard = {"inline_keyboard": [
+            [{"text": "✅ Yes, Delete", "callback_data": f"confirm_delete_{dep_id}"},
+             {"text": "❌ No", "callback_data": f"view_deploy_{dep_id}"}]
+        ]}
+        edit_message(chat_id, message_id,
+            f"*⚠️ DELETE DEPLOYMENT*\n\nDelete deployment `{dep_id}`?\n\n⚠️ Cannot be undone!",
+            keyboard)
+        return
+    
+    if data.startswith("confirm_delete_"):
+        dep_id = int(data.split("_")[2])
+        delete_deployment(dep_id, user_id, chat_id)
+        handle_deployments_list(chat_id, user_id, message_id)
+        return
+    
+    # ========== BUG REPORT ==========
+    if data == "report_bug":
+        if not is_user_verified(user_id):
+            send_verification_required(chat_id, user_id, "User", message_id)
+            return
+        set_user_step(user_id, 'awaiting_bug_report')
+        edit_message(chat_id, message_id,
+            "*🐛 REPORT A BUG*\n\nPlease describe the issue:\n\nType your report and send it:",
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+        return
+
+# ========== GET MENUS ==========
+def get_main_menu(user_id):
+    balances = get_user_balances(user_id)
+    is_verified = is_user_verified(user_id)
+    is_premium = is_user_premium(user_id)
+    verified_badge = "✅" if is_verified else "🔐"
+    premium_badge = "⭐" if is_premium else "🆓"
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": f"{verified_badge} Join Channel", "callback_data": "check_verification"}],
+            [{"text": "📤 Deploy New Bot", "callback_data": "deploy_new"}],
+            [{"text": "🐙 Deploy from GitHub", "callback_data": "github_deploy"}],
+            [{"text": f"{premium_badge} Free Deployment (24h)", "callback_data": "free_deployment"}],
+            [{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
+            [{"text": f"💰 {balances['coins']}🪙 | {balances['stars']}⭐", "callback_data": "my_balance"}],
+            [{"text": "🎫 Redeem Code", "callback_data": "redeem_code"},
+             {"text": "👥 Referral", "callback_data": "my_referral"}],
+            [{"text": "⭐ Premium Subscription", "callback_data": "subscribe_premium"},
+             {"text": "🐛 Report Bug", "callback_data": "report_bug"}],
+        ]
+    }
+    if is_admin(user_id):
+        keyboard["inline_keyboard"].append([{"text": "🔧 Admin Panel", "callback_data": "admin_panel"}])
+    return keyboard
+
+def get_deploy_menu(user_id):
+    is_premium = is_user_premium(user_id)
+    if is_premium or is_admin(user_id):
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "📅 Monthly (30 days) - FREE for Premium", "callback_data": "plan_monthly"}],
+                [{"text": "🌟 Yearly (365 days) - FREE for Premium", "callback_data": "plan_yearly"}],
+                [{"text": "🆓 Free Deployment (24h)", "callback_data": "free_deployment"}],
+                [{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]
+            ]
+        }
+    else:
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": f"📅 Monthly (30 days) - {PRICE_MONTHLY_STARS}⭐ / {PRICE_MONTHLY_COINS}🪙", "callback_data": "plan_monthly"}],
+                [{"text": f"🌟 Yearly (365 days) - {PRICE_YEARLY_STARS}⭐ / {PRICE_YEARLY_COINS}🪙", "callback_data": "plan_yearly"}],
+                [{"text": "🆓 Free Deployment (24h)", "callback_data": "free_deployment"}],
+                [{"text": "⭐ Get Premium", "callback_data": "subscribe_premium"}],
+                [{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]
+            ]
+        }
+    if is_admin(user_id):
+        keyboard["inline_keyboard"].insert(-1, [{"text": "♾️ Lifetime (never expires) — ADMIN", "callback_data": "plan_lifetime"}])
+    return keyboard
+
+# ========== PREMIUM MENU ==========
+def show_premium_menu(chat_id, user_id, message_id=None):
+    is_premium = is_user_premium(user_id)
+    
+    if is_premium:
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute("SELECT premium_expires, premium_plan FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        expires = datetime.fromisoformat(row[0]) if row and row[0] else None
+        plan = row[1] if row else "monthly"
+        if expires:
+            days_left = (expires - datetime.now()).days
+            text = (f"*⭐ PREMIUM MEMBER*\n\n✅ Plan: `{plan.upper()}`\n"
+                    f"📅 Expires: `{expires.strftime('%Y-%m-%d')}`\n⏰ Days left: `{days_left}`\n\n"
+                    f"✨ Benefits active!\n💰 Monthly/Yearly deployments are *FREE* for you!")
+        else:
+            text = "❌ Premium expired. Renew now!"
+        keyboard = {"inline_keyboard": [[{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]]}
+    else:
+        text = (f"*⭐ PREMIUM SUBSCRIPTION*\n\n✨ *Benefits:*\n• ✅ Unlimited free deployments (24h)\n"
+                f"• ✅ FREE Monthly/Yearly deployments\n• ✅ Priority support\n\n"
+                f"💰 *Pricing:*\n📅 Monthly: `{PRICE_MONTHLY_STARS}⭐` / `{PRICE_MONTHLY_COINS}🪙`\n"
+                f"🌟 Yearly: `{PRICE_YEARLY_STARS}⭐` / `{PRICE_YEARLY_COINS}🪙`")
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": f"⭐ Monthly ({PRICE_MONTHLY_STARS}⭐)", "callback_data": "premium_monthly_stars"},
+                 {"text": f"🪙 Monthly ({PRICE_MONTHLY_COINS}🪙)", "callback_data": "premium_monthly_coins"}],
+                [{"text": f"⭐ Yearly ({PRICE_YEARLY_STARS}⭐)", "callback_data": "premium_yearly_stars"},
+                 {"text": f"🪙 Yearly ({PRICE_YEARLY_COINS}🪙)", "callback_data": "premium_yearly_coins"}],
+                [{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]
+            ]
+        }
+    
+    if message_id:
+        edit_message(chat_id, message_id, text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+# ========== ADMIN PANEL ==========
+def show_admin_panel(chat_id, message_id):
+    stats = get_system_stats()
+    text = (f"*🔧 ADMIN PANEL*\n\n"
+            f"👥 Users: `{stats.get('total_users', 0)}`\n"
+            f"📦 Deployments: `{stats.get('total_deployments', 0)}`\n"
+            f"🟢 Active: `{stats.get('active_deployments', 0)}`\n"
+            f"⭐ Premium: `{stats.get('premium_users', 0)}`\n"
+            f"💰 Revenue: `${stats.get('revenue_usd', 0):.2f}`\n"
+            f"📊 Server: `{get_ultra_compressed_stats()}`")
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "👥 List Users", "callback_data": "admin_list_users"}],
+            [{"text": "📋 Deployments", "callback_data": "admin_list_deployments"}],
+            [{"text": "🎫 Create Redeem Code", "callback_data": "admin_create_code"}],
+            [{"text": "🪙 Add Coins", "callback_data": "admin_add_coins"}],
+            [{"text": "📢 Broadcast", "callback_data": "admin_broadcast"}],
+            [{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]
+        ]
+    }
+    edit_message(chat_id, message_id, text, keyboard)
+
+# ========== DEPLOYMENT HANDLERS ==========
+def handle_free_deployment(chat_id, user_id, message_id=None):
+    if not is_user_verified(user_id):
+        send_verification_required(chat_id, user_id, "User", message_id)
+        return
+    can_deploy, reason = can_use_free_deployment(user_id)
+    if not can_deploy:
+        edit_message(chat_id, message_id,
+            f"❌ *FREE DEPLOYMENT LIMIT REACHED*\n\n{reason}",
+            {"inline_keyboard": [[{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]]})
+        return
+    set_user_step(user_id, 'awaiting_file', plan='free', duration=FREE_DEPLOYMENT_DURATION_HOURS,
+                  cost_coins=0, cost_stars=0, payment_method='none')
+    text = (f"*🆓 FREE DEPLOYMENT*\n\n⏱️ Duration: `{FREE_DEPLOYMENT_DURATION_HOURS}` hours\n"
+            f"💰 Cost: FREE\n📦 Max size: `{MAX_FILE_SIZE_MB}MB`\n\n📤 *Send your Python/Node.js file*")
+    if message_id:
+        edit_message(chat_id, message_id, text,
+                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+    else:
+        send_message(chat_id, text,
+                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+
+def handle_paid_deployment(chat_id, user_id, message_id, plan, duration, cost_coins, cost_stars):
+    if not is_user_verified(user_id):
+        send_verification_required(chat_id, user_id, "User", message_id)
+        return
+    if plan == "lifetime" and not is_admin(user_id):
+        send_message(chat_id, "⛔ Lifetime deployments are admin-only.")
+        return
+    
+    set_user_step(user_id, 'awaiting_file', plan=plan, duration=duration,
+                  cost_coins=cost_coins, cost_stars=cost_stars, payment_method=None)
+    
+    if is_user_premium(user_id) or is_admin(user_id):
+        text = (f"*✨ PREMIUM BENEFIT!*\n\nYour {plan.upper()} deployment is *FREE*!\n\n"
+                f"📤 *Send your Python/Node.js file*")
+    else:
+        text = (f"*💰 {plan.capitalize()} DEPLOYMENT*\n\n⏱️ Duration: `{duration}` days\n"
+                f"⭐ Cost: `{cost_stars}⭐`\n🪙 Cost: `{cost_coins}🪙`\n\n"
+                f"📤 *Send your Python/Node.js file*")
+    
+    edit_message(chat_id, message_id, text,
+                {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "deploy_new"}]]})
+
+def handle_deployments_list(chat_id, user_id, message_id=None):
+    if not is_user_verified(user_id):
+        send_verification_required(chat_id, user_id, "User", message_id)
+        return
+    
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT deployment_id, file_name, file_size, plan, expire_time, status, is_free, framework FROM deployments WHERE user_id = ? ORDER BY deployment_id DESC", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        keyboard = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]}
+        if message_id:
+            edit_message(chat_id, message_id, "📭 *No Deployments*", keyboard)
+        else:
+            send_message(chat_id, "📭 *No Deployments*", keyboard)
+        return
+    
+    header = "📦 *Your Deployments*\n\n"
+    keyboard = {"inline_keyboard": []}
+    for dep_id, fname, fsize, plan, exp_str, status, is_free, framework in rows:
+        if status == "active":
+            status_icon = "✅"
+        elif status == "paused":
+            status_icon = "⏸️"
+        elif status == "stopped":
+            status_icon = "🛑"
+        elif status == "failed":
+            status_icon = "❌"
+        else:
+            status_icon = "❓"
+        icon = "🆓" if is_free else "⭐"
+        size_str = format_file_size(fsize) if fsize else "Unknown"
+        clean_fname = display_filename(fname)
+        keyboard["inline_keyboard"].append([{"text": f"{icon}{status_icon} ID:{dep_id} - {clean_fname[:20]} ({size_str})", 
+                     "callback_data": f"view_deploy_{dep_id}"}])
+    
+    keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "main_menu"}])
+    
+    if message_id:
+        edit_message(chat_id, message_id, header, keyboard)
+    else:
+        send_message(chat_id, header, keyboard)
+
+def view_deployment(chat_id, message_id, user_id, dep_id):
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT file_name, file_size, plan, status, is_free, framework, env_vars, start_time, expire_time FROM deployments WHERE deployment_id = ? AND user_id = ?", (dep_id, user_id))
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        edit_message(chat_id, message_id, "❌ Not found",
+                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "my_deployments"}]]})
+        return
+    
+    fname, fsize, plan, status, is_free, framework, env_vars_json, start_str, expire_str = row
+    size_str = format_file_size(fsize) if fsize else "Unknown"
+    status_emoji = "🟢 ACTIVE" if status == "active" else "⏸️ PAUSED" if status == "paused" else "🔴 STOPPED" if status == "stopped" else "❌ FAILED"
+    
+    # Get resource usage
+    resource_str = ""
+    if status == "active":
+        conn2 = sqlite3.connect(DATABASE_FILE)
+        c2 = conn2.cursor()
+        c2.execute("SELECT proc_pid FROM deployments WHERE deployment_id=?", (dep_id,))
+        pid_row = c2.fetchone()
+        conn2.close()
+        if pid_row and pid_row[0]:
+            ram = _get_ram_usage_pid(pid_row[0])
+            cpu = _get_cpu_usage_pid(pid_row[0])
+            resource_str = f"\n💾 RAM: `{ram:.1f}MB` | CPU: `{cpu:.1f}%`"
+    
+    text = (f"*📄 DEPLOYMENT #{dep_id}*\n\n📁 File: `{display_filename(fname)}` ({size_str})\n"
+            f"🔧 Framework: `{framework}`\n📋 Plan: `{plan.upper()}`\n🔘 Status: {status_emoji}{resource_str}")
+    
+    keyboard = {"inline_keyboard": [
+        [{"text": "🔄 Restart", "callback_data": f"restart_deploy_{dep_id}"}],
+        [{"text": "🗑️ Delete", "callback_data": f"delete_deploy_{dep_id}"}],
+        [{"text": "🔙 Back", "callback_data": "my_deployments"}]
+    ]}
+    edit_message(chat_id, message_id, text, keyboard)
+
+def delete_deployment(deployment_id, user_id, chat_id):
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute("SELECT proc_pid, file_name, user_id FROM deployments WHERE deployment_id = ?", (deployment_id,))
+        row = c.fetchone()
+        if not row:
+            send_message(chat_id, "❌ Deployment not found")
+            return False
+        proc_pid, file_name, owner_id = row
+        if owner_id != user_id and not is_admin(user_id):
+            send_message(chat_id, "❌ Permission denied")
+            return False
+        if proc_pid:
             try:
-                s.bind(('', port))
-                return port
-            except OSError:
-                continue
-    return preferred + 1
+                kill_deployment_process(proc_pid)
+                sleep(1)
+            except:
+                pass
+        deploy_folder = get_deploy_folder(owner_id, deployment_id)
+        if deploy_folder.exists():
+            shutil.rmtree(deploy_folder)
+        c.execute("DELETE FROM deployments WHERE deployment_id = ?", (deployment_id,))
+        conn.commit()
+        conn.close()
+        with deployment_lock:
+            if deployment_id in active_deployments:
+                del active_deployments[deployment_id]
+        update_system_stats()
+        send_message(chat_id, f"✅ Deployment `{deployment_id}` deleted!")
+        return True
+    except Exception as e:
+        send_message(chat_id, f"❌ Error deleting deployment: {str(e)}")
+        return False
 
 # ========== RESTART FUNCTIONS ==========
 def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: bool = False) -> bool:
@@ -1814,7 +1622,7 @@ def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: 
         conn = sqlite3.connect(DATABASE_FILE)
         c = conn.cursor()
         c.execute("""SELECT file_name, file_id, requirements_file_id, requirements_text, env_vars,
-                           folder_name, source_type, github_repo, github_branch, proc_pid, is_free, plan
+                           folder_name, source_type, github_repo, github_branch, proc_pid
                     FROM deployments WHERE deployment_id=? AND user_id=?""", 
                   (deployment_id, user_id))
         row = c.fetchone()
@@ -1822,7 +1630,7 @@ def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: 
             conn.close()
             return False
         
-        file_name, file_id, req_file_id, req_text, env_vars_json, folder_name, source_type, github_repo, github_branch, old_pid, is_free, plan = row
+        file_name, file_id, req_file_id, req_text, env_vars_json, folder_name, source_type, github_repo, github_branch, old_pid = row
         
         if old_pid:
             try:
@@ -1834,13 +1642,13 @@ def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: 
         if not deploy_folder.exists():
             deploy_folder.mkdir(parents=True, exist_ok=True)
         
-        # Retrieve files
+        env_vars = json.loads(env_vars_json) if env_vars_json else {}
+        
+        # For GitHub deployments, re-download
         if source_type == 'github' and github_repo:
             try:
                 owner, repo = github_repo.split('/')
                 token = GITHUB_TOKEN
-                env_vars = json.loads(env_vars_json) if env_vars_json else {}
-                
                 url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{github_branch or 'main'}"
                 headers = {"User-Agent": "BotHostingPlatform/1.0", "Accept": "application/vnd.github+json"}
                 if token:
@@ -1891,10 +1699,9 @@ def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: 
                 conn.close()
                 return False
         else:
+            # For upload deployments, download from Telegram
             if file_id:
-                # Download from Telegram using file_id
                 try:
-                    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/"
                     file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": file_id})
                     if file_info and file_info.get('ok'):
                         file_path = file_info['result']['file_path']
@@ -1943,8 +1750,6 @@ def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: 
                 with open(deploy_folder / 'requirements.txt', 'w') as f:
                     f.write(req_text)
         
-        env_vars = json.loads(env_vars_json) if env_vars_json else {}
-        
         if not dest_script.exists():
             conn.close()
             return False
@@ -1959,21 +1764,20 @@ def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: 
         
         req_file = deploy_folder / 'requirements.txt'
         if req_file.exists():
-            install_dependencies_enhanced(req_file, print, packages_dir)
+            install_dependencies_enhanced(req_file, packages_dir)
         elif req_text:
             req_file.write_text(req_text)
-            install_dependencies_enhanced(req_file, print, packages_dir)
+            install_dependencies_enhanced(req_file, packages_dir)
         
         ext = dest_script.suffix.lower()
         is_node = ext in ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
         
         if is_node:
             start_script, frameworks = create_node_launcher_script(
-                deploy_folder, dest_script, env_vars, print)
+                deploy_folder, dest_script, env_vars)
         else:
             launcher_script, frameworks = create_enhanced_launcher_script(
-                deploy_folder, dest_script, env_vars, code_content, print,
-                packages_dir=packages_dir)
+                deploy_folder, dest_script, env_vars, code_content, packages_dir=packages_dir)
             start_script = deploy_folder / "start.sh"
             start_script.write_text(
                 f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
@@ -2002,7 +1806,7 @@ def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: 
         if is_running:
             conn2 = sqlite3.connect(DATABASE_FILE)
             conn2.execute("""UPDATE deployments 
-                             SET proc_pid=?, status='active', is_paused=0, 
+                             SET proc_pid=?, status='active', is_paused=0,
                                  crash_restart_count=COALESCE(crash_restart_count,0)+1,
                                  last_crash_restart=?
                              WHERE deployment_id=?""",
@@ -2015,8 +1819,6 @@ def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: 
             
             if not is_auto_restart:
                 send_message(user_id, f"✅ *Bot #{deployment_id} Restarted!*")
-            
-            update_deployment_resources(deployment_id)
             return True
         else:
             conn2 = sqlite3.connect(DATABASE_FILE)
@@ -2030,406 +1832,289 @@ def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: 
         traceback.print_exc()
         return False
 
-# ========== USER STEP FUNCTIONS ==========
-def set_user_step(user_id, step, **kwargs):
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    _KNOWN = {'temp_file', 'requirements', 'env_vars', 'plan', 'payment_method',
-              'duration', 'cost_coins', 'cost_stars', 'waiting_for_env',
-              'waiting_for_reqs', 'waiting_for_redeem', 'temp_target_user',
-              'temp_coins_amount', 'temp_stars_amount', 'temp_expiry', 'temp_reward_type'}
-    updates = ["step = ?"]
-    values = [step]
-    for key in _KNOWN:
-        if key in kwargs:
-            updates.append(f"{key} = ?")
-            val = kwargs[key]
-            if key == 'env_vars' and val is not None and not isinstance(val, str):
-                val = json.dumps(val)
-            values.append(val)
-    if step is None:
-        pending = json.dumps({})
-    else:
-        c.execute("SELECT pending_json FROM users WHERE user_id = ?", (user_id,))
-        row = c.fetchone()
-        try:
-            existing = json.loads(row[0] or '{}') if row else {}
-        except Exception:
-            existing = {}
-        existing.update(kwargs)
-        existing['_step'] = step
-        pending = json.dumps(existing)
-    updates.append("pending_json = ?")
-    values.append(pending)
-    values.append(user_id)
-    c.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", values)
-    conn.commit()
-    conn.close()
-
-def get_user_step(user_id):
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute("""SELECT step, temp_file, requirements, env_vars, plan, payment_method,
-                        duration, cost_coins, cost_stars, waiting_for_env,
-                        waiting_for_reqs, waiting_for_redeem, temp_target_user,
-                        temp_coins_amount, temp_stars_amount, temp_expiry,
-                        temp_reward_type, pending_json
-                 FROM users WHERE user_id = ?""", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    _DEFAULTS = {
-        'step': None, 'temp_file': None, 'requirements': None, 'env_vars': {},
-        'plan': None, 'payment_method': None, 'duration': None,
-        'cost_coins': None, 'cost_stars': None,
-        'waiting_for_env': 0, 'waiting_for_reqs': 0, 'waiting_for_redeem': 0,
-        'temp_target_user': None, 'temp_coins_amount': None,
-        'temp_stars_amount': None, 'temp_expiry': None, 'temp_reward_type': None,
-    }
-    if not row:
-        return _DEFAULTS.copy()
+# ========== DEPENDENCY INSTALLER ==========
+def install_dependencies_enhanced(reqs_file, packages_dir=None):
+    if not reqs_file.exists():
+        return True, []
     try:
-        pj = json.loads(row[17] or '{}')
-    except Exception:
-        pj = {}
-    result = {**_DEFAULTS, **pj}
-    col_map = ['step','temp_file','requirements','env_vars','plan','payment_method',
-               'duration','cost_coins','cost_stars','waiting_for_env','waiting_for_reqs',
-               'waiting_for_redeem','temp_target_user','temp_coins_amount',
-               'temp_stars_amount','temp_expiry','temp_reward_type']
-    for i, key in enumerate(col_map):
-        val = row[i]
-        if val is None:
-            continue
-        if key == 'env_vars':
-            try:
-                val = json.loads(val)
-            except Exception:
-                val = {}
-        elif key in ('waiting_for_env','waiting_for_reqs','waiting_for_redeem'):
-            val = int(val or 0)
-        result[key] = val
-    return result
-
-# ========== HANDLER FUNCTIONS ==========
-def get_main_menu(user_id):
-    balances = get_user_balances(user_id)
-    is_verified = is_user_verified(user_id)
-    is_premium = is_user_premium(user_id)
-    verified_badge = "✅" if is_verified else "🔐"
-    premium_badge = "⭐" if is_premium else "🆓"
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": f"{verified_badge} Join Channel", "callback_data": "check_verification"}],
-            [{"text": "📤 Deploy New Bot", "callback_data": "deploy_new"}],
-            [{"text": "🐙 Deploy from GitHub", "callback_data": "github_deploy"}],
-            [{"text": f"{premium_badge} Free Deployment (24h)", "callback_data": "free_deployment"}],
-            [{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
-            [{"text": f"💰 {balances['coins']}🪙 | {balances['stars']}⭐", "callback_data": "my_balance"}],
-            [{"text": "🎫 Redeem Code", "callback_data": "redeem_code"},
-             {"text": "👥 Referral", "callback_data": "my_referral"}],
-            [{"text": "⭐ Premium Subscription", "callback_data": "subscribe_premium"},
-             {"text": "🐛 Report Bug", "callback_data": "report_bug"}],
-        ]
-    }
-    if is_admin(user_id):
-        keyboard["inline_keyboard"].append([{"text": "🔧 Admin Panel", "callback_data": "admin_panel"}])
-    return keyboard
-
-# ========== CALLBACK HANDLER ==========
-def handle_callback(callback):
-    callback_id = callback['id']
-    user_id = callback['from']['id']
-    message = callback.get('message', {})
-    chat_id = message.get('chat', {}).get('id')
-    message_id = message.get('message_id')
-    data = callback['data']
-    
-    answer_callback(callback_id)
-    
-    if data == "main_menu":
-        if is_user_verified(user_id):
-            balances = get_user_balances(user_id)
-            welcome = f"*🤖 BOT HOSTING*\n\n🪙 `{balances['coins']}` | ⭐ `{balances['stars']}`\n\nChoose:"
-            edit_message(chat_id, message_id, welcome, get_main_menu(user_id))
-        else:
-            user_info = get_user_info(user_id)
-            send_verification_required(chat_id, user_id, user_info.get('first_name', 'User'), message_id)
-        return
-    
-    if data == "check_verification":
-        if check_channel_membership(user_id):
-            mark_channel_joined(user_id)
-            if not has_accepted_tos(user_id):
-                show_tos_prompt(chat_id, user_id, message_id)
-                return
-            balances = get_user_balances(user_id)
-            edit_message(chat_id, message_id,
-                f"✅ *VERIFIED!*\n\n🪙 {balances['coins']} | ⭐ {balances['stars']}\n\nWelcome!",
-                get_main_menu(user_id))
-        else:
-            send_verification_required(chat_id, user_id, "User", message_id)
-        return
-    
-    if data == "verify_channel":
-        if check_channel_membership(user_id):
-            mark_channel_joined(user_id)
-            if not has_accepted_tos(user_id):
-                show_tos_prompt(chat_id, user_id, message_id)
-                return
-            balances = get_user_balances(user_id)
-            edit_message(chat_id, message_id,
-                f"✅ *VERIFIED!*\n\nThank you for joining!",
-                get_main_menu(user_id))
-        else:
-            edit_message(chat_id, message_id,
-                f"❌ *NOT VERIFIED*\n\nPlease join {REQUIRED_CHANNEL} first.",
-                {"inline_keyboard": [[{"text": "📢 JOIN", "url": CHANNEL_LINK},
-                                      {"text": "✅ VERIFY", "callback_data": "verify_channel"}]]})
-        return
-    
-    if data == "tos_agree":
-        mark_tos_accepted(user_id)
-        balances = get_user_balances(user_id)
-        edit_message(chat_id, message_id,
-            f"✅ *Thanks for confirming!*\n\n🪙 {balances['coins']} | ⭐ {balances['stars']}\n\nWelcome!",
-            get_main_menu(user_id))
-        return
-    
-    if data == "my_balance":
-        balances = get_user_balances(user_id)
-        is_premium = is_user_premium(user_id)
-        used_free = get_free_deployment_used_count(user_id)
-        free_remaining = FREE_USER_MAX_DEPLOYMENTS - used_free
-        text = (f"*💰 YOUR BALANCE*\n\n🪙 Coins: `{balances['coins']}`\n⭐ Stars: `{balances['stars']}`\n"
-                f"🎫 Status: {'⭐ PREMIUM' if is_premium else '🆓 FREE'}\n"
-                f"🆓 Free Slots: `{free_remaining}/{FREE_USER_MAX_DEPLOYMENTS}`")
-        edit_message(chat_id, message_id, text,
-                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]})
-        return
-    
-    if data == "redeem_code":
-        set_user_step(user_id, 'awaiting_redeem', waiting_for_redeem=1)
-        send_message(chat_id, f"*🎫 REDEEM CODE*\n\nSend your code:",
-                    {"inline_keyboard": [[{"text": "🔙 Cancel", "callback_data": "main_menu"}]]})
-        return
-    
-    if data == "subscribe_premium":
-        is_premium = is_user_premium(user_id)
-        if is_premium:
-            text = f"*⭐ PREMIUM MEMBER*\n\nYou already have premium! 🎉"
-        else:
-            text = (f"*⭐ PREMIUM SUBSCRIPTION*\n\n✨ *Benefits:*\n• ✅ Unlimited free deployments (24h)\n"
-                    f"• ✅ FREE Monthly/Yearly deployments\n• ✅ Priority support\n\n"
-                    f"💰 *Pricing:*\n📅 Monthly: `{PRICE_MONTHLY_STARS}⭐` / `{PRICE_MONTHLY_COINS}🪙`\n"
-                    f"🌟 Yearly: `{PRICE_YEARLY_STARS}⭐` / `{PRICE_YEARLY_COINS}🪙`")
-        edit_message(chat_id, message_id, text,
-                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]})
-        return
-    
-    if data == "deploy_new":
-        if not is_user_verified(user_id):
-            send_verification_required(chat_id, user_id, "User", message_id)
-            return
-        edit_message(chat_id, message_id, "*💰 DEPLOYMENT OPTIONS*\n\nChoose your plan:",
-                    {"inline_keyboard": [
-                        [{"text": "📅 Monthly (30 days)", "callback_data": "plan_monthly"}],
-                        [{"text": "🌟 Yearly (365 days)", "callback_data": "plan_yearly"}],
-                        [{"text": "🆓 Free Deployment (24h)", "callback_data": "free_deployment"}],
-                        [{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]
-                    ]})
-        return
-    
-    if data == "free_deployment":
-        can_deploy, reason = can_use_free_deployment(user_id)
-        if not can_deploy:
-            edit_message(chat_id, message_id,
-                f"❌ *FREE DEPLOYMENT LIMIT REACHED*\n\n{reason}",
-                {"inline_keyboard": [[{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]]})
-            return
-        set_user_step(user_id, 'awaiting_file', plan='free', duration=FREE_DEPLOYMENT_DURATION_HOURS,
-                      cost_coins=0, cost_stars=0, payment_method='none')
-        edit_message(chat_id, message_id,
-            f"*🆓 FREE DEPLOYMENT*\n\n⏱️ Duration: `{FREE_DEPLOYMENT_DURATION_HOURS}` hours\n"
-            f"💰 Cost: FREE\n📦 Max size: `{MAX_FILE_SIZE_MB}MB`\n\n📤 *Send your Python file (.py)*",
-            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
-        return
-    
-    if data == "my_deployments":
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("SELECT deployment_id, file_name, file_size, plan, expire_time, status, is_free, framework FROM deployments WHERE user_id = ? ORDER BY deployment_id DESC", (user_id,))
-        rows = c.fetchall()
-        conn.close()
+        with open(reqs_file, 'r') as f:
+            raw = f.read().strip()
+        if not raw:
+            return True, []
+        packages = [p.strip() for p in raw.split('\n')
+                    if p.strip() and not p.startswith('#') and not p.startswith('-')]
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
+                       capture_output=True, timeout=60)
         
-        if not rows:
-            edit_message(chat_id, message_id, "📭 *No Deployments*",
-                        {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]})
-            return
+        def _pip_cmd(pkg_or_flag, extra_flags=None):
+            cmd = [sys.executable, "-m", "pip", "install", "--upgrade",
+                   "--no-warn-script-location", "--quiet"]
+            if packages_dir:
+                cmd += ["--target", str(packages_dir)]
+            if extra_flags:
+                cmd += extra_flags
+            cmd.append(pkg_or_flag)
+            return cmd
         
-        header = "📦 *Your Deployments*\n\n"
-        keyboard = {"inline_keyboard": []}
-        for dep_id, fname, fsize, plan, exp_str, status, is_free, framework in rows:
-            if status == "active":
-                status_icon = "✅"
-            elif status == "paused":
-                status_icon = "⏸️"
-            elif status == "stopped":
-                status_icon = "🛑"
-            elif status == "failed":
-                status_icon = "❌"
+        success_count = 0
+        failed_packages = []
+        for i, package in enumerate(packages):
+            cmd = _pip_cmd(package)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if res.returncode == 0:
+                success_count += 1
             else:
-                status_icon = "❓"
-            icon = "🆓" if is_free else "⭐"
-            size_str = format_file_size(fsize) if fsize else "Unknown"
-            clean_fname = display_filename(fname)
-            keyboard["inline_keyboard"].append([{"text": f"{icon}{status_icon} ID:{dep_id} - {clean_fname[:20]} ({size_str})", 
-                         "callback_data": f"view_deploy_{dep_id}"}])
-        
-        keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "main_menu"}])
-        edit_message(chat_id, message_id, header, keyboard)
-        return
-    
-    if data.startswith("view_deploy_"):
-        dep_id = int(data.split("_")[2])
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("SELECT file_name, file_size, plan, status, is_free, framework, env_vars, start_time, expire_time FROM deployments WHERE deployment_id = ? AND user_id = ?", (dep_id, user_id))
-        row = c.fetchone()
-        conn.close()
-        if not row:
-            edit_message(chat_id, message_id, "❌ Not found",
-                        {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "my_deployments"}]]})
-            return
-        
-        fname, fsize, plan, status, is_free, framework, env_vars_json, start_str, expire_str = row
-        size_str = format_file_size(fsize) if fsize else "Unknown"
-        status_emoji = "🟢 ACTIVE" if status == "active" else "⏸️ PAUSED" if status == "paused" else "🔴 STOPPED" if status == "stopped" else "❌ FAILED"
-        
-        text = (f"*📄 DEPLOYMENT #{dep_id}*\n\n📁 File: `{display_filename(fname)}` ({size_str})\n"
-                f"🔧 Framework: `{framework}`\n📋 Plan: `{plan.upper()}`\n🔘 Status: {status_emoji}")
-        
-        keyboard = {"inline_keyboard": [
-            [{"text": "🔄 Restart", "callback_data": f"restart_deploy_{dep_id}"}],
-            [{"text": "🗑️ Delete", "callback_data": f"delete_deploy_{dep_id}"}],
-            [{"text": "🔙 Back", "callback_data": "my_deployments"}]
-        ]}
-        edit_message(chat_id, message_id, text, keyboard)
-        return
-    
-    if data.startswith("restart_deploy_"):
-        dep_id = int(data.split("_")[2])
-        send_message(chat_id, f"🔄 Restarting deployment #{dep_id}...")
-        success = restart_deployment_by_id(dep_id, user_id, is_auto_restart=False)
-        if success:
-            send_message(chat_id, f"✅ Deployment #{dep_id} restarted successfully!")
-        else:
-            send_message(chat_id, f"❌ Failed to restart deployment #{dep_id}")
-        return
-    
-    if data.startswith("delete_deploy_"):
-        dep_id = int(data.split("_")[2])
-        keyboard = {"inline_keyboard": [
-            [{"text": "✅ Yes, Delete", "callback_data": f"confirm_delete_{dep_id}"},
-             {"text": "❌ No", "callback_data": f"view_deploy_{dep_id}"}]
-        ]}
-        edit_message(chat_id, message_id,
-            f"*⚠️ DELETE DEPLOYMENT*\n\nDelete deployment `{dep_id}`?\n\n⚠️ Cannot be undone!",
-            keyboard)
-        return
-    
-    if data.startswith("confirm_delete_"):
-        dep_id = int(data.split("_")[2])
-        delete_deployment(dep_id, user_id, chat_id)
-        handle_deployments_list(chat_id, user_id, message_id)
-        return
-
-def handle_deployments_list(chat_id, user_id, message_id=None):
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute("SELECT deployment_id, file_name, file_size, plan, expire_time, status, is_free, framework FROM deployments WHERE user_id = ? ORDER BY deployment_id DESC", (user_id,))
-    rows = c.fetchall()
-    conn.close()
-    
-    if not rows:
-        keyboard = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]}
-        if message_id:
-            edit_message(chat_id, message_id, "📭 *No Deployments*", keyboard)
-        else:
-            send_message(chat_id, "📭 *No Deployments*", keyboard)
-        return
-    
-    header = "📦 *Your Deployments*\n\n"
-    keyboard = {"inline_keyboard": []}
-    for dep_id, fname, fsize, plan, exp_str, status, is_free, framework in rows:
-        if status == "active":
-            status_icon = "✅"
-        elif status == "paused":
-            status_icon = "⏸️"
-        elif status == "stopped":
-            status_icon = "🛑"
-        elif status == "failed":
-            status_icon = "❌"
-        else:
-            status_icon = "❓"
-        icon = "🆓" if is_free else "⭐"
-        size_str = format_file_size(fsize) if fsize else "Unknown"
-        clean_fname = display_filename(fname)
-        keyboard["inline_keyboard"].append([{"text": f"{icon}{status_icon} ID:{dep_id} - {clean_fname[:20]} ({size_str})", 
-                     "callback_data": f"view_deploy_{dep_id}"}])
-    
-    keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "main_menu"}])
-    
-    if message_id:
-        edit_message(chat_id, message_id, header, keyboard)
-    else:
-        send_message(chat_id, header, keyboard)
-
-def delete_deployment(deployment_id, user_id, chat_id):
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("SELECT proc_pid, file_name, user_id FROM deployments WHERE deployment_id = ?", (deployment_id,))
-        row = c.fetchone()
-        if not row:
-            send_message(chat_id, "❌ Deployment not found")
-            return False
-        proc_pid, file_name, owner_id = row
-        if owner_id != user_id and not is_admin(user_id):
-            send_message(chat_id, "❌ Permission denied")
-            return False
-        if proc_pid:
-            try:
-                kill_deployment_process(proc_pid)
-                sleep(1)
-            except:
-                pass
-        deploy_folder = get_deploy_folder(owner_id, deployment_id)
-        if deploy_folder.exists():
-            shutil.rmtree(deploy_folder)
-        c.execute("DELETE FROM deployments WHERE deployment_id = ?", (deployment_id,))
-        conn.commit()
-        conn.close()
-        with deployment_lock:
-            if deployment_id in active_deployments:
-                del active_deployments[deployment_id]
-        update_system_stats()
-        send_message(chat_id, f"✅ Deployment `{deployment_id}` deleted!")
-        return True
+                res2 = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--quiet", "--force-reinstall",
+                     *(["--target", str(packages_dir)] if packages_dir else []),
+                     package],
+                    capture_output=True, text=True, timeout=180)
+                if res2.returncode == 0:
+                    success_count += 1
+                else:
+                    failed_packages.append(package)
+        return (success_count / len(packages)) >= 0.7 if packages else True, failed_packages
     except Exception as e:
-        send_message(chat_id, f"❌ Error deleting deployment: {str(e)}")
-        return False
+        print(f"❌ Installer error: {e}")
+        return False, []
+
+# ========== LAUNCHER CREATION ==========
+def create_enhanced_launcher_script(deploy_folder, dest_script, env_vars_dict, code_content, packages_dir=None):
+    frameworks = detect_bot_framework(code_content)
+    launcher_script = deploy_folder / "run.py"
+    env_set_code = []
+    for k, v in env_vars_dict.items():
+        env_set_code.append(f'os.environ[{k!r}] = {v!r}')
+    env_set_str = "\n".join(env_set_code) if env_set_code else "# No custom environment variables"
+    packages_dir_str = str(packages_dir) if packages_dir else str(deploy_folder / 'packages')
+    with open(launcher_script, 'w', encoding='utf-8') as f:
+        f.write(f'''#!/usr/bin/env python3
+import os, sys, time, json, signal, threading, traceback
+from pathlib import Path
+_pkg_dir = r"{packages_dir_str}"
+if os.path.isdir(_pkg_dir) and _pkg_dir not in sys.path:
+    sys.path.insert(0, _pkg_dir)
+os.chdir(r"{deploy_folder}")
+_HOSTING_BOT_KEYS = {{
+    'BOT_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_BOT_TOKEN',
+    'TOKEN', 'API_TOKEN', 'TG_BOT_TOKEN', 'TGBOT_TOKEN',
+    'DISCORD_TOKEN', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',
+    'GITHUB_TOKEN', 'GITHUB_REPO_OWNER', 'GITHUB_REPO_NAME',
+    'GITHUB_BACKUP_BRANCH', 'GITHUB_BACKUP_PATH',
+    'DATABASE_URL', 'DATABASE_FILE',
+    'ADMIN_IDS', 'REQUIRED_CHANNEL', 'CHANNEL_LINK',
+}}
+for _hk in _HOSTING_BOT_KEYS:
+    os.environ.pop(_hk, None)
+{env_set_str}
+try:
+    from dotenv import load_dotenv
+    env_file = Path(r"{deploy_folder}") / ".env"
+    if env_file.exists():
+        load_dotenv(env_file, override=False)
+except ImportError:
+    pass
+except Exception:
+    pass
+print("🚀 STARTING BOT")
+sys.stdout.flush()
+_TOKEN_ALIASES = ['BOT_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_BOT_TOKEN',
+                  'TOKEN', 'API_TOKEN', 'TG_BOT_TOKEN', 'TGBOT_TOKEN',
+                  'DISCORD_TOKEN']
+_found_token = None
+for _alias in _TOKEN_ALIASES:
+    _t = os.environ.get(_alias, '')
+    if _t:
+        _found_token = _t
+        break
+if _found_token:
+    for _alias in _TOKEN_ALIASES:
+        if not os.environ.get(_alias):
+            os.environ[_alias] = _found_token
+try:
+    print("📌 Importing module...")
+    sys.stdout.flush()
+    sys.path.insert(0, r"{deploy_folder}")
+    import importlib.util, inspect as _inspect
+    spec = importlib.util.spec_from_file_location("user_bot", r"{dest_script}")
+    if spec is None:
+        raise ImportError(f"Cannot load module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["user_bot"] = module
+    _webhook_patches = []
+    try:
+        import telebot as _tb_mod
+        _orig_sw = _tb_mod.TeleBot.set_webhook
+        def _noop_set_webhook(self, *a, **kw):
+            pass
+        _tb_mod.TeleBot.set_webhook = _noop_set_webhook
+        _webhook_patches.append((_tb_mod.TeleBot, 'set_webhook', _orig_sw))
+    except ImportError:
+        pass
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        for _obj, _attr, _orig in _webhook_patches:
+            setattr(_obj, _attr, _orig)
+    print("✅ Module loaded")
+    sys.stdout.flush()
+    def _clear_webhook(bot_obj):
+        try:
+            get_info = getattr(bot_obj, 'get_webhook_info', None)
+            if callable(get_info):
+                _wh = get_info()
+                _url = getattr(_wh, 'url', '') or ''
+                if _url:
+                    remove_fn = (getattr(bot_obj, 'remove_webhook', None) or
+                                 getattr(bot_obj, 'delete_webhook', None))
+                    if callable(remove_fn):
+                        remove_fn()
+                    time.sleep(1)
+        except Exception:
+            pass
+    def _make_runner(name, obj):
+        if callable(getattr(obj, 'polling', None)):
+            print(f"  📱 {{name}} → polling")
+            def _run_telebot(_b=obj):
+                _clear_webhook(_b)
+                _b.polling(non_stop=True, timeout=60)
+            return _run_telebot
+        if hasattr(obj, 'run_polling'):
+            print(f"  📱 {{name}} → run_polling")
+            def _run_aiogram(_a=obj):
+                _clear_webhook(_a)
+                _a.run_polling()
+            return _run_aiogram
+        if hasattr(obj, 'run') and callable(obj.run):
+            print(f"  ▶️  {{name}} → .run()")
+            return lambda: obj.run()
+        if callable(obj):
+            return None
+        return None
+    entry_points = ['main', 'run', 'start', 'bot', 'dp', 'dispatcher',
+                    'updater', 'setup', 'client', 'app', 'application']
+    for entry in entry_points:
+        if not hasattr(module, entry):
+            continue
+        attr = getattr(module, entry)
+        if not callable(attr):
+            continue
+        print(f"✅ Entry point: {{entry}}")
+        sys.stdout.flush()
+        runner = _make_runner(entry, attr)
+        try:
+            if runner is not None:
+                runner()
+            else:
+                result = attr()
+                if result is not None:
+                    sub = _make_runner(f"{{entry}}() result", result)
+                    if sub is not None:
+                        sub()
+                    elif callable(getattr(result, 'polling', None)):
+                        result.polling(non_stop=True, timeout=60)
+                    elif callable(getattr(result, 'run_polling', None)):
+                        result.run_polling()
+                    elif callable(getattr(result, 'run', None)):
+                        result.run()
+        except Exception as _err:
+            print(f"❌ Error in {{entry}}: {{_err}}")
+            traceback.print_exc()
+            sys.exit(1)
+        sys.exit(0)
+    print("⚠️ No entry point — running as subprocess...")
+    sys.stdout.flush()
+except Exception as e:
+    print(f"⚠️ Import failed: {{e}}")
+    sys.stdout.flush()
+import subprocess
+try:
+    result = subprocess.run([sys.executable, r"{dest_script}"])
+    sys.exit(result.returncode)
+except Exception as e:
+    print(f"❌ Subprocess failed: {{e}}")
+    sys.exit(1)
+''')
+    launcher_script.chmod(0o755)
+    return launcher_script, frameworks
+
+def create_node_launcher_script(deploy_folder: Path, dest_script: Path, env_vars_dict: dict) -> tuple:
+    ext = dest_script.suffix.lower()
+    if ext in ('.ts', '.tsx'):
+        run_cmd = (f'if command -v npx &>/dev/null; then\n'
+                   f'    setsid npx --yes tsx "{dest_script}" >> output.log 2>&1 &\n'
+                   f'elif command -v ts-node &>/dev/null; then\n'
+                   f'    setsid ts-node "{dest_script}" >> output.log 2>&1 &\n'
+                   f'else\n'
+                   f'    echo "❌ No TypeScript runner found" >> output.log\n'
+                   f'    exit 1\n'
+                   f'fi')
+        framework = ['typescript']
+    elif ext in ('.mjs',):
+        run_cmd = f'setsid node --input-type=module "{dest_script}" >> output.log 2>&1 &'
+        framework = ['node_esm']
+    else:
+        run_cmd = f'setsid node "{dest_script}" >> output.log 2>&1 &'
+        framework = ['node']
+    try:
+        code = dest_script.read_text(errors='ignore')
+        if 'discord' in code.lower():
+            framework.append('discord_js')
+        if 'telegraf' in code.lower() or 'node-telegram' in code.lower():
+            framework.append('telegram_node')
+        if 'express' in code.lower() or 'fastify' in code.lower():
+            framework.append('web_server')
+    except Exception:
+        pass
+    env_file = deploy_folder / '.env'
+    env_file.write_text('\n'.join(f'{k}={v}' for k, v in env_vars_dict.items()) + '\n')
+    def _sh_quote(value):
+        return "'" + str(value).replace("'", "'\\''") + "'"
+    env_lines = '\n'.join(f'export {k}={_sh_quote(v)}' for k, v in env_vars_dict.items())
+    npm_install = ('if [ -f "package.json" ]; then\n'
+                   '    echo "📦 Installing npm packages..." >> output.log\n'
+                   '    npm install --no-audit --no-fund >> output.log 2>&1\n'
+                   'fi')
+    start_content = (f'#!/bin/bash\n'
+                     f'cd "{deploy_folder}"\n'
+                     f'export PYTHONUNBUFFERED=1\n'
+                     f'{env_lines}\n\n'
+                     f'{npm_install}\n\n'
+                     f'{run_cmd}\n'
+                     f'echo $! > pid.txt\n')
+    start_script = deploy_folder / 'start.sh'
+    start_script.write_text(start_content)
+    start_script.chmod(0o755)
+    return start_script, framework
+
+def detect_bot_framework(code_content: str) -> list:
+    detected = []
+    code_lower = code_content.lower()
+    patterns = {
+        'telegram': ['import telebot', 'from telebot', 'TeleBot(', 'from telegram', 'from telegram.ext', 'Application.builder'],
+        'discord': ['import discord', 'from discord', 'discord.Client(', 'commands.Bot('],
+        'flask': ['from flask import', 'import flask', 'Flask(__name__)'],
+        'fastapi': ['from fastapi', 'import fastapi', 'FastAPI()'],
+        'django': ['import django', 'from django', 'DJANGO_SETTINGS'],
+    }
+    for platform, pats in patterns.items():
+        for pat in pats:
+            if pat.lower() in code_lower:
+                detected.append(platform)
+                break
+    return detected if detected else ['generic']
 
 # ========== MESSAGE HANDLER ==========
 def handle_message(message):
     chat_id = message['chat']['id']
     user_id = message['from']['id']
     first_name = message['from'].get('first_name', 'User')
+    username = message['from'].get('username', '')
     
     if 'text' in message and message['text'].startswith('/start'):
         parts = message['text'].split(maxsplit=1)
         start_param = parts[1].strip() if len(parts) > 1 else ""
-        handle_start(chat_id, user_id, message['from'].get('username', ''), first_name, start_param)
+        handle_start(chat_id, user_id, username, first_name, start_param)
         return
     
     user_step = get_user_step(user_id)
@@ -2437,10 +2122,92 @@ def handle_message(message):
     if 'text' in message:
         text = message['text']
         
+        # Redeem code
         if user_step.get('waiting_for_redeem') == 1:
             success, msg = redeem_code(user_id, text.strip())
             send_message(chat_id, msg, {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
             set_user_step(user_id, None, waiting_for_redeem=0)
+            return
+        
+        # Bug report
+        if user_step.get('step') == 'awaiting_bug_report':
+            if text.strip():
+                report_id = submit_bug_report(user_id, username, first_name, text.strip())
+                set_user_step(user_id, None)
+                send_message(chat_id,
+                    f"✅ *Bug Report #{report_id} Submitted!*\n\nThank you!",
+                    {"inline_keyboard": [[{"text": "🏠 Main Menu", "callback_data": "main_menu"}]]})
+            else:
+                send_message(chat_id, "❌ Report cannot be empty.")
+            return
+        
+        # GitHub URL
+        if user_step.get('step') == 'awaiting_github_url':
+            # Parse GitHub URL
+            raw = text.strip()
+            if 'github.com' in raw:
+                parts = raw.split('github.com/')
+                if len(parts) > 1:
+                    repo_path = parts[1].rstrip('/')
+                    if '@' in repo_path:
+                        repo_path, branch = repo_path.split('@')
+                    else:
+                        branch = 'main'
+                    if '/' in repo_path:
+                        owner, repo = repo_path.split('/')[:2]
+                        set_user_step(user_id, 'awaiting_github_env',
+                                     temp_github_owner=owner,
+                                     temp_github_repo=repo,
+                                     temp_github_branch=branch)
+                        send_message(chat_id,
+                            f"✅ Repo: `{owner}/{repo}`\nBranch: `{branch}`\n\nSend environment variables (KEY=VALUE) or type `skip`:",
+                            {"inline_keyboard": [[{"text": "⏭️ Skip", "callback_data": "github_skip"}],
+                                                [{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+                        return
+            send_message(chat_id, "❌ Invalid GitHub URL. Try: `https://github.com/owner/repo`")
+            return
+        
+        # GitHub env vars
+        if user_step.get('step') == 'awaiting_github_env':
+            env_vars = {}
+            if text.strip().lower() != 'skip':
+                for line in text.strip().split('\n'):
+                    if '=' in line:
+                        k, v = line.split('=', 1)
+                        env_vars[k.strip()] = v.strip()
+            # Deploy from GitHub
+            owner = user_step.get('temp_github_owner')
+            repo = user_step.get('temp_github_repo')
+            branch = user_step.get('temp_github_branch', 'main')
+            set_user_step(user_id, None)
+            send_message(chat_id, f"🚀 Deploying `{owner}/{repo}` from GitHub...")
+            deploy_from_github(chat_id, user_id, owner, repo, branch, env_vars)
+            return
+        
+        # Environment variables for file upload
+        if user_step.get('step') == 'awaiting_env' or user_step.get('waiting_for_env') == 1:
+            env_vars = {}
+            if text.strip().lower() != 'skip':
+                for line in text.strip().split('\n'):
+                    if '=' in line:
+                        k, v = line.split('=', 1)
+                        env_vars[k.strip()] = v.strip()
+            
+            temp_file = user_step.get('temp_file')
+            plan = user_step.get('plan', 'free')
+            duration = user_step.get('duration', FREE_DEPLOYMENT_DURATION_HOURS)
+            cost_coins = user_step.get('cost_coins', 0)
+            cost_stars = user_step.get('cost_stars', 0)
+            payment_method = user_step.get('payment_method', 'none')
+            file_id = user_step.get('temp_file_id')
+            req_text = user_step.get('requirements')
+            req_file_id = user_step.get('requirements_file_id')
+            
+            set_user_step(user_id, None)
+            
+            # Deploy the bot
+            deploy_with_logs(chat_id, user_id, temp_file, req_text, req_file_id, env_vars, file_id,
+                           plan, duration, cost_coins, cost_stars, payment_method)
             return
         
         if not is_user_verified(user_id):
@@ -2450,11 +2217,12 @@ def handle_message(message):
         send_message(chat_id, "❌ Unknown command. Use buttons below.", get_main_menu(user_id))
         return
     
+    # Handle file upload
     if 'document' in message:
         doc = message['document']
         file_name = doc.get('file_name', 'unknown')
         file_size = doc.get('file_size', 0)
-        print(f"📁 File: {file_name} ({format_file_size(file_size)})")
+        file_id = doc.get('file_id')
         
         if file_size > MAX_FILE_SIZE_BYTES:
             send_message(chat_id, f"❌ File too large! Max {MAX_FILE_SIZE_MB}MB")
@@ -2464,88 +2232,82 @@ def handle_message(message):
             send_verification_required(chat_id, user_id, first_name, None)
             return
         
-        # Handle file upload for deployment
+        user_step = get_user_step(user_id)
+        
+        # Main bot file
         if user_step.get('step') == 'awaiting_file':
             ext = os.path.splitext(file_name)[1].lower()
             if ext not in ['.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx']:
                 send_message(chat_id, f"❌ Unsupported file type `{ext}`. Send .py or .js")
                 return
             
-            file_id = doc['file_id']
-            file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": file_id})
-            if not file_info or not file_info.get('ok'):
-                send_message(chat_id, "❌ Failed to download file from Telegram.")
-                return
-            
-            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info['result']['file_path']}"
-            try:
-                req = urllib.request.Request(file_url)
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    file_bytes = resp.read()
-            except Exception as e:
-                send_message(chat_id, f"❌ Download error: {e}")
-                return
-            
             temp_file = BASE_DIR / f"temp_{user_id}_{file_name}"
-            with open(temp_file, 'wb') as f:
-                f.write(file_bytes)
-            
-            # Store file_id for restart
-            set_user_step(user_id, 'awaiting_reqs',
-                         temp_file=str(temp_file),
-                         temp_file_id=file_id,
-                         plan=user_step.get('plan', 'free'),
-                         duration=user_step.get('duration', FREE_DEPLOYMENT_DURATION_HOURS),
-                         cost_coins=user_step.get('cost_coins', 0),
-                         cost_stars=user_step.get('cost_stars', 0),
-                         payment_method=user_step.get('payment_method', 'none'),
-                         env_vars={})
-            
-            send_message(chat_id,
-                f"✅ File accepted: `{file_name}` ({format_file_size(file_size)})\n\n"
-                f"Now send `requirements.txt` or click Auto-detect:",
-                {"inline_keyboard": [
-                    [{"text": "📦 Send requirements.txt", "callback_data": "reqs_yes"}],
-                    [{"text": "⚡ Auto-detect & Skip", "callback_data": "reqs_no"}],
-                    [{"text": "❌ Cancel", "callback_data": "cancel_deploy"}]
-                ]})
+            file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": file_id})
+            if file_info and file_info.get('ok'):
+                file_path = file_info['result']['file_path']
+                download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+                try:
+                    req = urllib.request.Request(download_url)
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        content = resp.read()
+                    with open(temp_file, 'wb') as f:
+                        f.write(content)
+                    
+                    set_user_step(user_id, 'awaiting_reqs',
+                                 temp_file=str(temp_file),
+                                 temp_file_id=file_id,
+                                 plan=user_step.get('plan', 'free'),
+                                 duration=user_step.get('duration', FREE_DEPLOYMENT_DURATION_HOURS),
+                                 cost_coins=user_step.get('cost_coins', 0),
+                                 cost_stars=user_step.get('cost_stars', 0),
+                                 payment_method=user_step.get('payment_method', 'none'))
+                    
+                    send_message(chat_id,
+                        f"✅ File accepted: `{file_name}` ({format_file_size(file_size)})\n\n"
+                        f"Send `requirements.txt` or click Auto-detect:",
+                        {"inline_keyboard": [
+                            [{"text": "📦 Send requirements.txt", "callback_data": "reqs_yes"}],
+                            [{"text": "⚡ Auto-detect & Skip", "callback_data": "reqs_no"}],
+                            [{"text": "❌ Cancel", "callback_data": "cancel_deploy"}]
+                        ]})
+                except Exception as e:
+                    send_message(chat_id, f"❌ Download error: {e}")
             return
         
-        # Handle requirements file
-        if user_step.get('waiting_for_reqs') == 1:
+        # Requirements file
+        if user_step.get('step') == 'awaiting_reqs':
             if file_name == 'requirements.txt' or file_name.endswith('.txt'):
-                file_id = doc['file_id']
                 file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": file_id})
                 if file_info and file_info.get('ok'):
-                    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info['result']['file_path']}"
+                    file_path = file_info['result']['file_path']
+                    download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
                     try:
-                        req = urllib.request.Request(file_url)
+                        req = urllib.request.Request(download_url)
                         with urllib.request.urlopen(req, timeout=60) as resp:
                             req_text = resp.read().decode('utf-8', errors='replace')
                         
                         set_user_step(user_id, 'awaiting_env',
-                                     waiting_for_env=1, waiting_for_reqs=0,
                                      temp_file=user_step.get('temp_file'),
                                      temp_file_id=user_step.get('temp_file_id'),
                                      requirements=req_text,
                                      requirements_file_id=file_id,
-                                     env_vars=user_step.get('env_vars', {}),
+                                     env_vars={},
                                      plan=user_step.get('plan'),
                                      duration=user_step.get('duration'),
                                      cost_coins=user_step.get('cost_coins'),
                                      cost_stars=user_step.get('cost_stars'),
-                                     payment_method=user_step.get('payment_method'))
+                                     payment_method=user_step.get('payment_method'),
+                                     waiting_for_env=1)
                         
                         send_message(chat_id,
-                            f"✅ Requirements received! ({len(req_text.splitlines())} lines)\n\n"
-                            f"Now send environment variables (KEY=VALUE, one per line) or click Skip:",
+                            f"✅ Requirements received!\n\nSend environment variables (KEY=VALUE) or type `skip`:",
                             {"inline_keyboard": [
                                 [{"text": "⏭️ Skip Env Vars", "callback_data": "env_skip"}],
                                 [{"text": "❌ Cancel", "callback_data": "cancel_deploy"}]
                             ]})
                     except Exception as e:
                         send_message(chat_id, f"❌ Error reading file: {e}")
-                return
+            return
         
         send_message(chat_id, "❌ Please start a deployment first.", get_main_menu(user_id))
         return
@@ -2554,6 +2316,330 @@ def handle_message(message):
         send_verification_required(chat_id, user_id, first_name, None)
     else:
         send_message(chat_id, "❌ Please use the buttons below.", get_main_menu(user_id))
+
+# ========== DEPLOYMENT FUNCTIONS ==========
+def deploy_from_github(chat_id, user_id, owner, repo, branch, env_vars):
+    try:
+        # Create deployment
+        deploy_id = int(datetime.now().timestamp())
+        deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(deploy_id)
+        deploy_folder.mkdir(parents=True, exist_ok=True)
+        
+        # Download repo
+        url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{branch}"
+        headers = {"User-Agent": "BotHostingPlatform/1.0", "Accept": "application/vnd.github+json"}
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+        
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            tarball = resp.read()
+        
+        import tarfile, io
+        with tarfile.open(fileobj=io.BytesIO(tarball), mode='r:gz') as tar:
+            members = tar.getmembers()
+            if members:
+                prefix = members[0].name.split('/')[0] + '/'
+            else:
+                prefix = ''
+            for member in members:
+                rel = member.name
+                if rel.startswith(prefix):
+                    rel = rel[len(prefix):]
+                if not rel:
+                    continue
+                member.name = rel
+                if rel.startswith('/') or '..' in rel:
+                    continue
+                try:
+                    tar.extract(member, deploy_folder)
+                except Exception:
+                    pass
+        
+        # Find main file
+        dest_script = None
+        for candidate in ['main.py', 'bot.py', 'app.py', 'run.py', 'start.py', 'index.py']:
+            test_path = deploy_folder / candidate
+            if test_path.exists():
+                dest_script = test_path
+                break
+        if not dest_script:
+            py_files = list(deploy_folder.glob('*.py'))
+            if py_files:
+                dest_script = py_files[0]
+        
+        if not dest_script:
+            send_message(chat_id, "❌ No main Python file found in repo")
+            return False
+        
+        # Install dependencies
+        packages_dir = deploy_folder / 'packages'
+        packages_dir.mkdir(exist_ok=True)
+        install_from_repo_requirements(deploy_folder, packages_dir)
+        
+        # Read code
+        code_content = dest_script.read_text(errors='ignore')
+        
+        # Create launcher
+        launcher_script, frameworks = create_enhanced_launcher_script(
+            deploy_folder, dest_script, env_vars, code_content, packages_dir=packages_dir)
+        
+        start_script = deploy_folder / "start.sh"
+        start_script.write_text(
+            f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
+            f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+        start_script.chmod(0o755)
+        
+        # Start
+        subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
+        sleep(5)
+        
+        pid_file = deploy_folder / "pid.txt"
+        proc_pid = None
+        if pid_file.exists():
+            try:
+                proc_pid = int(pid_file.read_text().strip())
+            except:
+                pass
+        
+        is_running = False
+        if proc_pid:
+            try:
+                os.kill(proc_pid, 0)
+                is_running = True
+            except:
+                pass
+        
+        if is_running:
+            start_time = datetime.now()
+            expire_time = start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
+            
+            conn = sqlite3.connect(DATABASE_FILE)
+            c = conn.cursor()
+            c.execute('''INSERT INTO deployments 
+                (user_id, file_name, file_size, env_vars, plan, start_time, expire_time, status, proc_pid,
+                 is_free, framework, folder_name, source_type, github_repo, github_branch)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (user_id, dest_script.name, dest_script.stat().st_size, json.dumps(env_vars),
+                 'free', start_time.isoformat(), expire_time.isoformat(), "active", proc_pid,
+                 1, ', '.join(frameworks), str(deploy_id), "github", f"{owner}/{repo}", branch))
+            deployment_db_id = c.lastrowid
+            conn.commit()
+            conn.close()
+            
+            with deployment_lock:
+                active_deployments[deployment_db_id] = proc_pid
+            
+            send_message(chat_id,
+                f"*🎉 GITHUB DEPLOYMENT SUCCESSFUL!*\n\n"
+                f"🐙 Repo: `{owner}/{repo}`\n🌿 Branch: `{branch}`\n"
+                f"📅 Expires: `{expire_time.strftime('%Y-%m-%d %H:%M')}`\n🆔 ID: `{deployment_db_id}`",
+                {"inline_keyboard": [
+                    [{"text": "📄 Logs", "callback_data": f"view_deploy_{deployment_db_id}"}],
+                    [{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
+                    [{"text": "🏠 Menu", "callback_data": "main_menu"}]
+                ]})
+            return True
+        else:
+            send_message(chat_id, "❌ Deployment failed to start. Check logs.")
+            return False
+            
+    except Exception as e:
+        send_message(chat_id, f"❌ GitHub deployment error: {e}")
+        return False
+
+def install_from_repo_requirements(deploy_folder, packages_dir):
+    for fname in ['requirements.txt', 'requirements-dev.txt']:
+        req_path = deploy_folder / fname
+        if req_path.exists():
+            install_dependencies_enhanced(req_path, packages_dir)
+
+def deploy_with_logs(chat_id, user_id, temp_file, req_text, req_file_id, env_vars, file_id,
+                    plan, duration, cost_coins, cost_stars, payment_method):
+    try:
+        deploy_id = int(datetime.now().timestamp())
+        deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(deploy_id)
+        deploy_folder.mkdir(parents=True, exist_ok=True)
+        packages_dir = deploy_folder / 'packages'
+        packages_dir.mkdir(exist_ok=True)
+        
+        # Get file info from temp_file
+        temp_path = Path(temp_file)
+        file_name = temp_path.name
+        dest_script = deploy_folder / file_name
+        shutil.copy2(temp_path, dest_script)
+        file_size = dest_script.stat().st_size
+        
+        # Save requirements
+        req_text_saved = req_text
+        if req_file_id:
+            file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": req_file_id})
+            if file_info and file_info.get('ok'):
+                file_path = file_info['result']['file_path']
+                download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+                try:
+                    req = urllib.request.Request(download_url)
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        req_text_saved = resp.read().decode('utf-8', errors='replace')
+                        with open(deploy_folder / 'requirements.txt', 'w') as f:
+                            f.write(req_text_saved)
+                except Exception:
+                    pass
+        
+        if req_text_saved:
+            req_path = deploy_folder / 'requirements.txt'
+            if not req_path.exists():
+                with open(req_path, 'w') as f:
+                    f.write(req_text_saved)
+            install_dependencies_enhanced(req_path, packages_dir)
+        
+        # Read code
+        code_content = dest_script.read_text(errors='ignore')
+        
+        # Create env file
+        env_file = deploy_folder / ".env"
+        with open(env_file, 'w') as f:
+            for k, v in env_vars.items():
+                f.write(f"{k}={v}\n")
+        
+        # Create launcher
+        launcher_script, frameworks = create_enhanced_launcher_script(
+            deploy_folder, dest_script, env_vars, code_content, packages_dir=packages_dir)
+        
+        start_script = deploy_folder / "start.sh"
+        start_script.write_text(
+            f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
+            f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+        start_script.chmod(0o755)
+        
+        # Start
+        subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
+        sleep(5)
+        
+        pid_file = deploy_folder / "pid.txt"
+        proc_pid = None
+        if pid_file.exists():
+            try:
+                proc_pid = int(pid_file.read_text().strip())
+            except:
+                pass
+        
+        is_running = False
+        if proc_pid:
+            try:
+                os.kill(proc_pid, 0)
+                is_running = True
+            except:
+                pass
+        
+        if is_running:
+            start_time = datetime.now()
+            is_free = (plan == 'free')
+            if is_free:
+                expire_time = start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
+            else:
+                expire_time = start_time + timedelta(days=duration)
+            
+            conn = sqlite3.connect(DATABASE_FILE)
+            c = conn.cursor()
+            c.execute('''INSERT INTO deployments 
+                (user_id, file_name, file_size, file_id, requirements_file_id, requirements_text, env_vars,
+                 plan, payment_method, cost_coins, cost_stars, start_time, expire_time, status, proc_pid,
+                 is_free, framework, folder_name, source_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (user_id, file_name, file_size, file_id, req_file_id, req_text_saved or "", json.dumps(env_vars),
+                 plan, payment_method, cost_coins, cost_stars,
+                 start_time.isoformat(), expire_time.isoformat(), "active", proc_pid,
+                 1 if is_free else 0, ', '.join(frameworks), str(deploy_id), "upload"))
+            deployment_db_id = c.lastrowid
+            conn.commit()
+            conn.close()
+            
+            with deployment_lock:
+                active_deployments[deployment_db_id] = proc_pid
+            
+            Path(temp_file).unlink(missing_ok=True)
+            set_user_step(user_id, None)
+            
+            expiry_line = f"📅 *Expires:* {expire_time.strftime('%Y-%m-%d %H:%M')}"
+            duration_line = f"⏱️ *Duration:* {duration if not is_free else FREE_DEPLOYMENT_DURATION_HOURS} {'days' if not is_free else 'hours'}"
+            
+            send_message(chat_id,
+                f"*🎉 DEPLOYMENT SUCCESSFUL!*\n\n"
+                f"📁 File: `{display_filename(file_name)}`\n"
+                f"🤖 Platform: {', '.join(frameworks)}\n"
+                f"📋 Plan: {plan.upper()}\n"
+                f"{duration_line}\n{expiry_line}\n"
+                f"🆔 ID: `{deployment_db_id}`",
+                {"inline_keyboard": [
+                    [{"text": "📄 Logs", "callback_data": f"view_deploy_{deployment_db_id}"}],
+                    [{"text": "🔄 Restart", "callback_data": f"restart_deploy_{deployment_db_id}"}],
+                    [{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
+                    [{"text": "🏠 Menu", "callback_data": "main_menu"}]
+                ]})
+            return True
+        else:
+            error_tail = ""
+            log_file = deploy_folder / "output.log"
+            if log_file.exists():
+                error_tail = log_file.read_text(errors='replace')[-500:]
+            send_message(chat_id, f"❌ *DEPLOYMENT FAILED*\n\n```\n{error_tail}\n```")
+            Path(temp_file).unlink(missing_ok=True)
+            return False
+            
+    except Exception as e:
+        send_message(chat_id, f"❌ Deployment error: {e}")
+        Path(temp_file).unlink(missing_ok=True)
+        return False
+
+# ========== START HANDLER ==========
+def handle_start(chat_id, user_id, username, first_name, start_param=""):
+    is_new = False
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    is_new = c.fetchone() is None
+    c.execute("INSERT OR IGNORE INTO users (user_id, username, first_name, join_date) VALUES (?, ?, ?, ?)",
+              (user_id, username, first_name, datetime.now().isoformat()))
+    c.execute("UPDATE users SET last_active = ?, username = ?, first_name = ? WHERE user_id = ?",
+              (datetime.now().isoformat(), username, first_name, user_id))
+    conn.commit()
+    conn.close()
+    
+    if is_new and start_param and start_param.startswith("ref"):
+        try:
+            referrer_id = int(start_param[3:])
+            credited = process_referral(referrer_id, user_id)
+            if credited:
+                send_message(referrer_id,
+                    f"🎉 *Referral Bonus!*\n\nYou earned *{REFERRAL_REWARD_COINS} 🪙* coins.",
+                    {"inline_keyboard": [[{"text": "👥 My Referrals", "callback_data": "my_referral"}]]})
+        except Exception:
+            pass
+    
+    update_system_stats()
+    get_or_create_referral_code(user_id)
+    
+    if is_user_verified(user_id):
+        if not has_accepted_tos(user_id):
+            show_tos_prompt(chat_id, user_id)
+            return
+        balances = get_user_balances(user_id)
+        is_premium = is_user_premium(user_id)
+        used_free = get_free_deployment_used_count(user_id)
+        free_remaining = FREE_USER_MAX_DEPLOYMENTS - used_free
+        premium_badge = "⭐ PREMIUM ⭐" if is_premium else "🆓 FREE"
+        
+        welcome = (f"*🤖 BOT HOSTING SERVICE*\n\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                   f"👤 Welcome *{first_name}*!\n🪙 Coins: `{balances['coins']}`\n⭐ Stars: `{balances['stars']}`\n"
+                   f"🎫 Status: {premium_badge}\n🆓 Free Slots: `{free_remaining}/{FREE_USER_MAX_DEPLOYMENTS}`\n"
+                   f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                   f"💰 Monthly: `{PRICE_MONTHLY_STARS}⭐` / `{PRICE_MONTHLY_COINS}🪙`\n"
+                   f"💰 Yearly: `{PRICE_YEARLY_STARS}⭐` / `{PRICE_YEARLY_COINS}🪙`\n"
+                   f"📦 Max file size: `{MAX_FILE_SIZE_MB}MB`\n\nChoose an option:")
+        send_message(chat_id, welcome, get_main_menu(user_id))
+    else:
+        send_verification_required(chat_id, user_id, first_name)
 
 # ========== HEALTH MONITOR ==========
 def health_monitor():
@@ -2578,64 +2664,6 @@ def health_monitor():
             sleep(60)
 
 # ========== MAIN ==========
-def handle_start(chat_id, user_id, username, first_name, start_param=""):
-    is_new = False
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    is_new = c.fetchone() is None
-    c.execute("INSERT OR IGNORE INTO users (user_id, username, first_name, join_date) VALUES (?, ?, ?, ?)",
-              (user_id, username, first_name, datetime.now().isoformat()))
-    c.execute("UPDATE users SET last_active = ?, username = ?, first_name = ? WHERE user_id = ?",
-              (datetime.now().isoformat(), username, first_name, user_id))
-    conn.commit()
-    conn.close()
-    if is_new and start_param and start_param.startswith("ref"):
-        try:
-            referrer_id = int(start_param[3:])
-            credited = process_referral(referrer_id, user_id)
-            if credited:
-                send_message(referrer_id,
-                    f"🎉 *Referral Bonus!*\n\nYou earned *{REFERRAL_REWARD_COINS} 🪙* coins.",
-                    {"inline_keyboard": [[{"text": "👥 My Referrals", "callback_data": "my_referral"}]]})
-        except Exception:
-            pass
-    update_system_stats()
-    get_or_create_referral_code(user_id)
-    if is_user_verified(user_id):
-        if not has_accepted_tos(user_id):
-            show_tos_prompt(chat_id, user_id)
-            return
-        balances = get_user_balances(user_id)
-        is_premium = is_user_premium(user_id)
-        used_free = get_free_deployment_used_count(user_id)
-        free_remaining = FREE_USER_MAX_DEPLOYMENTS - used_free
-        stats = get_system_stats()
-        server_start = stats.get('server_start_time')
-        uptime = 0
-        if server_start:
-            start_time = datetime.fromisoformat(server_start)
-            uptime = (datetime.now() - start_time).total_seconds()
-        premium_badge = "⭐ PREMIUM ⭐" if is_premium else "🆓 FREE"
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM deployments WHERE user_id = ? AND status = 'paused'", (user_id,))
-        paused_count = c.fetchone()[0] or 0
-        conn.close()
-        welcome = (f"*🤖 BOT HOSTING SERVICE*\n\n━━━━━━━━━━━━━━━━━━━━━━\n"
-                   f"👤 Welcome *{first_name}*!\n🪙 Coins: `{balances['coins']}`\n⭐ Stars: `{balances['stars']}`\n"
-                   f"🎫 Status: {premium_badge}\n🆓 Free Slots: `{free_remaining}/{FREE_USER_MAX_DEPLOYMENTS}`\n"
-                   f"⏸️ Paused: `{paused_count}`\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                   f"🖥️ Server Uptime: `{format_uptime(uptime)}`\n"
-                   f"💱 Exchange: `1⭐ = {STARS_PER_COIN}🪙`\n\n"
-                   f"*⭐ Premium Benefits:*\n• Unlimited free deployments (24h)\n• FREE Monthly/Yearly deployments\n"
-                   f"💰 Monthly: `{PRICE_MONTHLY_STARS}⭐` / `{PRICE_MONTHLY_COINS}🪙`\n"
-                   f"💰 Yearly: `{PRICE_YEARLY_STARS}⭐` / `{PRICE_YEARLY_COINS}🪙`\n"
-                   f"📦 Max file size: `{MAX_FILE_SIZE_MB}MB`\n\nChoose an option:")
-        send_message(chat_id, welcome, get_main_menu(user_id))
-    else:
-        send_verification_required(chat_id, user_id, first_name)
-
 def main():
     global LAST_UPDATE_ID
     
@@ -2646,14 +2674,14 @@ def main():
     print(f"🆓 Free Tier: {FREE_USER_MAX_DEPLOYMENTS} x {FREE_DEPLOYMENT_DURATION_HOURS}h")
     print("=" * 70)
     
-    # Start health check server FIRST (critical for Render)
+    # Start health check server
     health_server = start_health_server()
     
     # Initialize database
     init_db()
     update_system_stats()
     
-    # Start health monitor thread
+    # Start health monitor
     threading.Thread(target=health_monitor, daemon=True).start()
     
     try:
@@ -2682,16 +2710,8 @@ def main():
                     
                     if 'callback_query' in update:
                         handle_callback(update['callback_query'])
-                    elif 'pre_checkout_query' in update:
-                        # Handle pre-checkout query
-                        pass
                     elif 'message' in update:
-                        msg = update['message']
-                        if 'successful_payment' in msg:
-                            # Handle successful payment
-                            pass
-                        else:
-                            handle_message(msg)
+                        handle_message(update['message'])
             sleep(0.5)
         except KeyboardInterrupt:
             print("\n🛑 Bot stopped")
