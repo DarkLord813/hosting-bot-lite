@@ -247,6 +247,7 @@ def init_db():
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
     
+    # Users table with ALL needed columns including temp_file_id and requirements_file_id
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -266,7 +267,9 @@ def init_db():
         premium_plan TEXT,
         step TEXT,
         temp_file TEXT,
+        temp_file_id TEXT,
         requirements TEXT,
+        requirements_file_id TEXT,
         env_vars TEXT,
         plan TEXT,
         payment_method TEXT,
@@ -290,6 +293,7 @@ def init_db():
         tos_accepted INTEGER DEFAULT 0
     )''')
     
+    # Deployments table
     c.execute('''CREATE TABLE IF NOT EXISTS deployments (
         deployment_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -324,6 +328,7 @@ def init_db():
         last_crash_restart TEXT
     )''')
     
+    # Subscriptions table
     c.execute('''CREATE TABLE IF NOT EXISTS subscriptions (
         subscription_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -338,6 +343,7 @@ def init_db():
         payment_payload TEXT
     )''')
     
+    # Coin transactions table
     c.execute('''CREATE TABLE IF NOT EXISTS coin_transactions (
         transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -349,6 +355,7 @@ def init_db():
         status TEXT
     )''')
     
+    # Star transactions table
     c.execute('''CREATE TABLE IF NOT EXISTS star_transactions (
         transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -361,6 +368,7 @@ def init_db():
         payload TEXT
     )''')
     
+    # Redeem codes table
     c.execute('''CREATE TABLE IF NOT EXISTS redeem_codes (
         code_id INTEGER PRIMARY KEY AUTOINCREMENT,
         code TEXT UNIQUE,
@@ -376,6 +384,7 @@ def init_db():
         used_by TEXT
     )''')
     
+    # Pending deployments table
     c.execute('''CREATE TABLE IF NOT EXISTS pending_deployments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -394,6 +403,7 @@ def init_db():
         status TEXT
     )''')
     
+    # System stats table
     c.execute('''CREATE TABLE IF NOT EXISTS system_stats (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         total_users INTEGER DEFAULT 0,
@@ -410,6 +420,7 @@ def init_db():
         last_updated TEXT
     )''')
     
+    # Bug reports table
     c.execute('''CREATE TABLE IF NOT EXISTS bug_reports (
         report_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -423,6 +434,7 @@ def init_db():
         replied_at TEXT
     )''')
     
+    # Referrals table
     c.execute('''CREATE TABLE IF NOT EXISTS referrals (
         referral_id INTEGER PRIMARY KEY AUTOINCREMENT,
         referrer_id INTEGER NOT NULL,
@@ -432,6 +444,17 @@ def init_db():
         reward_given INTEGER DEFAULT 0
     )''')
     
+    # Indexes for better performance
+    c.execute('CREATE INDEX IF NOT EXISTS idx_deployments_user ON deployments(user_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments(status)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_deployments_expire ON deployments(expire_time)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_subscriptions_expire ON subscriptions(end_date)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_bug_reports_status ON bug_reports(status)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_bug_reports_user ON bug_reports(user_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)')
+    
+    # Insert initial system stats
     c.execute('INSERT OR IGNORE INTO system_stats (id, server_start_time, last_updated) VALUES (1, ?, ?)', 
               (datetime.now().isoformat(), datetime.now().isoformat()))
     
@@ -439,7 +462,7 @@ def init_db():
     conn.close()
     print("✅ Database initialized")
 
-# ========== HELPERS ==========
+# ========== HELPER FUNCTIONS ==========
 def send_message(chat_id, text, keyboard=None, parse_mode="Markdown"):
     url = f"{TELEGRAM_API}/sendMessage"
     text = str(text or '')[:4096]
@@ -1026,13 +1049,19 @@ def set_user_step(user_id, step, **kwargs):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    _KNOWN = {'temp_file', 'requirements', 'env_vars', 'plan', 'payment_method',
-              'duration', 'cost_coins', 'cost_stars', 'waiting_for_env',
-              'waiting_for_reqs', 'waiting_for_redeem', 'temp_target_user',
-              'temp_coins_amount', 'temp_stars_amount', 'temp_expiry', 'temp_reward_type',
-              'temp_file_id', 'requirements_file_id'}
+    
+    # All known fields that can be stored in the users table
+    _KNOWN = {
+        'temp_file', 'temp_file_id', 'requirements', 'requirements_file_id', 
+        'env_vars', 'plan', 'payment_method', 'duration', 'cost_coins', 'cost_stars',
+        'waiting_for_env', 'waiting_for_reqs', 'waiting_for_redeem', 
+        'temp_target_user', 'temp_coins_amount', 'temp_stars_amount', 
+        'temp_expiry', 'temp_reward_type'
+    }
+    
     updates = ["step = ?"]
     values = [step]
+    
     for key in _KNOWN:
         if key in kwargs:
             updates.append(f"{key} = ?")
@@ -1040,6 +1069,8 @@ def set_user_step(user_id, step, **kwargs):
             if key == 'env_vars' and val is not None and not isinstance(val, str):
                 val = json.dumps(val)
             values.append(val)
+    
+    # Store everything in pending_json for backward compatibility
     if step is None:
         pending = json.dumps({})
     else:
@@ -1052,9 +1083,11 @@ def set_user_step(user_id, step, **kwargs):
         existing.update(kwargs)
         existing['_step'] = step
         pending = json.dumps(existing)
+    
     updates.append("pending_json = ?")
     values.append(pending)
     values.append(user_id)
+    
     c.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", values)
     conn.commit()
     conn.close()
@@ -1062,46 +1095,58 @@ def set_user_step(user_id, step, **kwargs):
 def get_user_step(user_id):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
-    c.execute("""SELECT step, temp_file, requirements, env_vars, plan, payment_method,
-                        duration, cost_coins, cost_stars, waiting_for_env,
-                        waiting_for_reqs, waiting_for_redeem, temp_target_user,
-                        temp_coins_amount, temp_stars_amount, temp_expiry,
-                        temp_reward_type, pending_json
+    c.execute("""SELECT step, temp_file, temp_file_id, requirements, requirements_file_id, 
+                        env_vars, plan, payment_method, duration, cost_coins, cost_stars,
+                        waiting_for_env, waiting_for_reqs, waiting_for_redeem,
+                        temp_target_user, temp_coins_amount, temp_stars_amount,
+                        temp_expiry, temp_reward_type, pending_json
                  FROM users WHERE user_id = ?""", (user_id,))
     row = c.fetchone()
     conn.close()
+    
     _DEFAULTS = {
-        'step': None, 'temp_file': None, 'requirements': None, 'env_vars': {},
-        'plan': None, 'payment_method': None, 'duration': None,
-        'cost_coins': None, 'cost_stars': None,
+        'step': None, 'temp_file': None, 'temp_file_id': None,
+        'requirements': None, 'requirements_file_id': None,
+        'env_vars': {}, 'plan': None, 'payment_method': None,
+        'duration': None, 'cost_coins': None, 'cost_stars': None,
         'waiting_for_env': 0, 'waiting_for_reqs': 0, 'waiting_for_redeem': 0,
         'temp_target_user': None, 'temp_coins_amount': None,
         'temp_stars_amount': None, 'temp_expiry': None, 'temp_reward_type': None,
-        'temp_file_id': None, 'requirements_file_id': None,
     }
+    
     if not row:
         return _DEFAULTS.copy()
+    
     try:
-        pj = json.loads(row[17] or '{}')
+        pj = json.loads(row[19] or '{}') if len(row) > 19 else {}
     except Exception:
         pj = {}
+    
     result = {**_DEFAULTS, **pj}
-    col_map = ['step','temp_file','requirements','env_vars','plan','payment_method',
-               'duration','cost_coins','cost_stars','waiting_for_env','waiting_for_reqs',
-               'waiting_for_redeem','temp_target_user','temp_coins_amount',
-               'temp_stars_amount','temp_expiry','temp_reward_type']
+    
+    col_map = [
+        'step', 'temp_file', 'temp_file_id', 'requirements', 'requirements_file_id',
+        'env_vars', 'plan', 'payment_method', 'duration', 'cost_coins', 'cost_stars',
+        'waiting_for_env', 'waiting_for_reqs', 'waiting_for_redeem',
+        'temp_target_user', 'temp_coins_amount', 'temp_stars_amount',
+        'temp_expiry', 'temp_reward_type'
+    ]
+    
     for i, key in enumerate(col_map):
+        if i >= len(row):
+            break
         val = row[i]
         if val is None:
             continue
         if key == 'env_vars':
             try:
-                val = json.loads(val)
+                val = json.loads(val) if isinstance(val, str) else val
             except Exception:
                 val = {}
-        elif key in ('waiting_for_env','waiting_for_reqs','waiting_for_redeem'):
+        elif key in ('waiting_for_env', 'waiting_for_reqs', 'waiting_for_redeem'):
             val = int(val or 0)
         result[key] = val
+    
     return result
 
 # ========== KILL PROCESS ==========
@@ -1138,208 +1183,6 @@ def get_deploy_folder(user_id, deployment_id):
     except Exception:
         pass
     return DEPLOYMENTS_DIR / str(user_id) / str(deployment_id)
-
-# ========== FULL CALLBACK HANDLER ==========
-def handle_callback(callback):
-    callback_id = callback['id']
-    user_id = callback['from']['id']
-    message = callback.get('message', {})
-    chat_id = message.get('chat', {}).get('id')
-    message_id = message.get('message_id')
-    data = callback['data']
-    
-    answer_callback(callback_id)
-    print(f"📨 Callback: {data} from user {user_id}")
-    
-    # ========== MAIN MENU ==========
-    if data == "main_menu":
-        if is_user_verified(user_id):
-            balances = get_user_balances(user_id)
-            welcome = f"*🤖 BOT HOSTING*\n\n🪙 `{balances['coins']}` | ⭐ `{balances['stars']}`\n\nChoose:"
-            edit_message(chat_id, message_id, welcome, get_main_menu(user_id))
-        else:
-            user_info = get_user_info(user_id)
-            send_verification_required(chat_id, user_id, user_info.get('first_name', 'User'), message_id)
-        return
-    
-    # ========== ADMIN PANEL ==========
-    if data == "admin_panel":
-        if is_admin(user_id):
-            show_admin_panel(chat_id, message_id)
-        else:
-            edit_message(chat_id, message_id, "🔒 Unauthorized!")
-        return
-    
-    # ========== REFERRALS ==========
-    if data == "my_referral":
-        show_referral_menu(chat_id, user_id, message_id)
-        return
-    
-    # ========== PREMIUM SUBSCRIPTION ==========
-    if data == "subscribe_premium":
-        show_premium_menu(chat_id, user_id, message_id)
-        return
-    
-    # ========== GITHUB DEPLOYMENT ==========
-    if data == "github_deploy":
-        if not is_user_verified(user_id):
-            send_verification_required(chat_id, user_id, "User", message_id)
-            return
-        set_user_step(user_id, 'awaiting_github_url')
-        edit_message(chat_id, message_id,
-            "*🐙 DEPLOY FROM GITHUB*\n\nSend me the GitHub repository URL or shorthand:\n\n"
-            "*Examples:*\n"
-            "`https://github.com/owner/repo`\n"
-            "`owner/repo`\n"
-            "`owner/repo@branch` ← specific branch\n\n"
-            "Supports *public and private* repos.",
-            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
-        return
-    
-    # ========== CHANNEL VERIFICATION ==========
-    if data == "check_verification":
-        if check_channel_membership(user_id):
-            mark_channel_joined(user_id)
-            if not has_accepted_tos(user_id):
-                show_tos_prompt(chat_id, user_id, message_id)
-                return
-            balances = get_user_balances(user_id)
-            edit_message(chat_id, message_id,
-                f"✅ *VERIFIED!*\n\n🪙 {balances['coins']} | ⭐ {balances['stars']}\n\nWelcome!",
-                get_main_menu(user_id))
-        else:
-            send_verification_required(chat_id, user_id, "User", message_id)
-        return
-    
-    if data == "verify_channel":
-        if check_channel_membership(user_id):
-            mark_channel_joined(user_id)
-            if not has_accepted_tos(user_id):
-                show_tos_prompt(chat_id, user_id, message_id)
-                return
-            balances = get_user_balances(user_id)
-            edit_message(chat_id, message_id,
-                f"✅ *VERIFIED!*\n\nThank you for joining {REQUIRED_CHANNEL}!",
-                get_main_menu(user_id))
-        else:
-            edit_message(chat_id, message_id,
-                f"❌ *NOT VERIFIED*\n\nPlease join {REQUIRED_CHANNEL} first.",
-                {"inline_keyboard": [[{"text": "📢 JOIN", "url": CHANNEL_LINK},
-                                      {"text": "✅ VERIFY", "callback_data": "verify_channel"}]]})
-        return
-    
-    # ========== TERMS OF SERVICE ==========
-    if data == "tos_agree":
-        mark_tos_accepted(user_id)
-        balances = get_user_balances(user_id)
-        edit_message(chat_id, message_id,
-            f"✅ *Thanks for confirming!*\n\n🪙 {balances['coins']} | ⭐ {balances['stars']}\n\nWelcome!",
-            get_main_menu(user_id))
-        return
-    
-    # ========== MY BALANCE ==========
-    if data == "my_balance":
-        balances = get_user_balances(user_id)
-        is_premium = is_user_premium(user_id)
-        used_free = get_free_deployment_used_count(user_id)
-        free_remaining = FREE_USER_MAX_DEPLOYMENTS - used_free
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("SELECT total_coins_earned, total_coins_spent, total_stars_earned, total_stars_spent FROM users WHERE user_id = ?", (user_id,))
-        row = c.fetchone()
-        conn.close()
-        text = (f"*💰 YOUR BALANCE*\n\n🪙 Coins: `{balances['coins']}`\n⭐ Stars: `{balances['stars']}`\n"
-                f"🎫 Status: {'⭐ PREMIUM' if is_premium else '🆓 FREE'}\n"
-                f"🆓 Free Slots: `{free_remaining}/{FREE_USER_MAX_DEPLOYMENTS}`\n"
-                f"🪙 Earned: `{row[0] if row else 0}`\n🪙 Spent: `{row[1] if row else 0}`\n"
-                f"⭐ Earned: `{row[2] if row else 0}`\n⭐ Spent: `{row[3] if row else 0}`")
-        edit_message(chat_id, message_id, text,
-                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]})
-        return
-    
-    # ========== REDEEM CODE ==========
-    if data == "redeem_code":
-        set_user_step(user_id, 'awaiting_redeem', waiting_for_redeem=1)
-        send_message(chat_id, f"*🎫 REDEEM CODE*\n\nSend your code:",
-                    {"inline_keyboard": [[{"text": "🔙 Cancel", "callback_data": "main_menu"}]]})
-        return
-    
-    # ========== DEPLOY NEW ==========
-    if data == "deploy_new":
-        if not is_user_verified(user_id):
-            send_verification_required(chat_id, user_id, "User", message_id)
-            return
-        edit_message(chat_id, message_id, "*💰 DEPLOYMENT OPTIONS*\n\nChoose your plan:",
-                    get_deploy_menu(user_id))
-        return
-    
-    if data == "plan_monthly":
-        handle_paid_deployment(chat_id, user_id, message_id, "monthly", 30, PRICE_MONTHLY_COINS, PRICE_MONTHLY_STARS)
-        return
-    
-    if data == "plan_yearly":
-        handle_paid_deployment(chat_id, user_id, message_id, "yearly", 365, PRICE_YEARLY_COINS, PRICE_YEARLY_STARS)
-        return
-    
-    if data == "plan_lifetime":
-        if not is_admin(user_id):
-            answer_callback(callback_id, "⛔ Admins only", show_alert=True)
-            return
-        handle_paid_deployment(chat_id, user_id, message_id, "lifetime", 0, 0, 0)
-        return
-    
-    # ========== FREE DEPLOYMENT ==========
-    if data == "free_deployment":
-        handle_free_deployment(chat_id, user_id, message_id)
-        return
-    
-    # ========== MY DEPLOYMENTS ==========
-    if data == "my_deployments":
-        handle_deployments_list(chat_id, user_id, message_id)
-        return
-    
-    if data.startswith("view_deploy_"):
-        dep_id = int(data.split("_")[2])
-        view_deployment(chat_id, message_id, user_id, dep_id)
-        return
-    
-    if data.startswith("restart_deploy_"):
-        dep_id = int(data.split("_")[2])
-        send_message(chat_id, f"🔄 Restarting deployment #{dep_id}...")
-        success = restart_deployment_by_id(dep_id, user_id, is_auto_restart=False)
-        if success:
-            send_message(chat_id, f"✅ Deployment #{dep_id} restarted successfully!")
-        else:
-            send_message(chat_id, f"❌ Failed to restart deployment #{dep_id}")
-        return
-    
-    if data.startswith("delete_deploy_"):
-        dep_id = int(data.split("_")[2])
-        keyboard = {"inline_keyboard": [
-            [{"text": "✅ Yes, Delete", "callback_data": f"confirm_delete_{dep_id}"},
-             {"text": "❌ No", "callback_data": f"view_deploy_{dep_id}"}]
-        ]}
-        edit_message(chat_id, message_id,
-            f"*⚠️ DELETE DEPLOYMENT*\n\nDelete deployment `{dep_id}`?\n\n⚠️ Cannot be undone!",
-            keyboard)
-        return
-    
-    if data.startswith("confirm_delete_"):
-        dep_id = int(data.split("_")[2])
-        delete_deployment(dep_id, user_id, chat_id)
-        handle_deployments_list(chat_id, user_id, message_id)
-        return
-    
-    # ========== BUG REPORT ==========
-    if data == "report_bug":
-        if not is_user_verified(user_id):
-            send_verification_required(chat_id, user_id, "User", message_id)
-            return
-        set_user_step(user_id, 'awaiting_bug_report')
-        edit_message(chat_id, message_id,
-            "*🐛 REPORT A BUG*\n\nPlease describe the issue:\n\nType your report and send it:",
-            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
-        return
 
 # ========== GET MENUS ==========
 def get_main_menu(user_id):
@@ -1453,383 +1296,280 @@ def show_admin_panel(chat_id, message_id):
     }
     edit_message(chat_id, message_id, text, keyboard)
 
-# ========== DEPLOYMENT HANDLERS ==========
-def handle_free_deployment(chat_id, user_id, message_id=None):
-    if not is_user_verified(user_id):
-        send_verification_required(chat_id, user_id, "User", message_id)
-        return
-    can_deploy, reason = can_use_free_deployment(user_id)
-    if not can_deploy:
-        edit_message(chat_id, message_id,
-            f"❌ *FREE DEPLOYMENT LIMIT REACHED*\n\n{reason}",
-            {"inline_keyboard": [[{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]]})
-        return
-    set_user_step(user_id, 'awaiting_file', plan='free', duration=FREE_DEPLOYMENT_DURATION_HOURS,
-                  cost_coins=0, cost_stars=0, payment_method='none')
-    text = (f"*🆓 FREE DEPLOYMENT*\n\n⏱️ Duration: `{FREE_DEPLOYMENT_DURATION_HOURS}` hours\n"
-            f"💰 Cost: FREE\n📦 Max size: `{MAX_FILE_SIZE_MB}MB`\n\n📤 *Send your Python/Node.js file*")
-    if message_id:
-        edit_message(chat_id, message_id, text,
-                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
-    else:
-        send_message(chat_id, text,
-                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
-
-def handle_paid_deployment(chat_id, user_id, message_id, plan, duration, cost_coins, cost_stars):
-    if not is_user_verified(user_id):
-        send_verification_required(chat_id, user_id, "User", message_id)
-        return
-    if plan == "lifetime" and not is_admin(user_id):
-        send_message(chat_id, "⛔ Lifetime deployments are admin-only.")
-        return
-    
-    set_user_step(user_id, 'awaiting_file', plan=plan, duration=duration,
-                  cost_coins=cost_coins, cost_stars=cost_stars, payment_method=None)
-    
-    if is_user_premium(user_id) or is_admin(user_id):
-        text = (f"*✨ PREMIUM BENEFIT!*\n\nYour {plan.upper()} deployment is *FREE*!\n\n"
-                f"📤 *Send your Python/Node.js file*")
-    else:
-        text = (f"*💰 {plan.capitalize()} DEPLOYMENT*\n\n⏱️ Duration: `{duration}` days\n"
-                f"⭐ Cost: `{cost_stars}⭐`\n🪙 Cost: `{cost_coins}🪙`\n\n"
-                f"📤 *Send your Python/Node.js file*")
-    
-    edit_message(chat_id, message_id, text,
-                {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "deploy_new"}]]})
-
-def handle_deployments_list(chat_id, user_id, message_id=None):
-    if not is_user_verified(user_id):
-        send_verification_required(chat_id, user_id, "User", message_id)
-        return
-    
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute("SELECT deployment_id, file_name, file_size, plan, expire_time, status, is_free, framework FROM deployments WHERE user_id = ? ORDER BY deployment_id DESC", (user_id,))
-    rows = c.fetchall()
-    conn.close()
-    
-    if not rows:
-        keyboard = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]}
-        if message_id:
-            edit_message(chat_id, message_id, "📭 *No Deployments*", keyboard)
-        else:
-            send_message(chat_id, "📭 *No Deployments*", keyboard)
-        return
-    
-    header = "📦 *Your Deployments*\n\n"
-    keyboard = {"inline_keyboard": []}
-    for dep_id, fname, fsize, plan, exp_str, status, is_free, framework in rows:
-        if status == "active":
-            status_icon = "✅"
-        elif status == "paused":
-            status_icon = "⏸️"
-        elif status == "stopped":
-            status_icon = "🛑"
-        elif status == "failed":
-            status_icon = "❌"
-        else:
-            status_icon = "❓"
-        icon = "🆓" if is_free else "⭐"
-        size_str = format_file_size(fsize) if fsize else "Unknown"
-        clean_fname = display_filename(fname)
-        keyboard["inline_keyboard"].append([{"text": f"{icon}{status_icon} ID:{dep_id} - {clean_fname[:20]} ({size_str})", 
-                     "callback_data": f"view_deploy_{dep_id}"}])
-    
-    keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "main_menu"}])
-    
-    if message_id:
-        edit_message(chat_id, message_id, header, keyboard)
-    else:
-        send_message(chat_id, header, keyboard)
-
-def view_deployment(chat_id, message_id, user_id, dep_id):
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute("SELECT file_name, file_size, plan, status, is_free, framework, env_vars, start_time, expire_time FROM deployments WHERE deployment_id = ? AND user_id = ?", (dep_id, user_id))
-    row = c.fetchone()
-    conn.close()
-    
-    if not row:
-        edit_message(chat_id, message_id, "❌ Not found",
-                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "my_deployments"}]]})
-        return
-    
-    fname, fsize, plan, status, is_free, framework, env_vars_json, start_str, expire_str = row
-    size_str = format_file_size(fsize) if fsize else "Unknown"
-    status_emoji = "🟢 ACTIVE" if status == "active" else "⏸️ PAUSED" if status == "paused" else "🔴 STOPPED" if status == "stopped" else "❌ FAILED"
-    
-    # Get resource usage
-    resource_str = ""
-    if status == "active":
-        conn2 = sqlite3.connect(DATABASE_FILE)
-        c2 = conn2.cursor()
-        c2.execute("SELECT proc_pid FROM deployments WHERE deployment_id=?", (dep_id,))
-        pid_row = c2.fetchone()
-        conn2.close()
-        if pid_row and pid_row[0]:
-            ram = _get_ram_usage_pid(pid_row[0])
-            cpu = _get_cpu_usage_pid(pid_row[0])
-            resource_str = f"\n💾 RAM: `{ram:.1f}MB` | CPU: `{cpu:.1f}%`"
-    
-    text = (f"*📄 DEPLOYMENT #{dep_id}*\n\n📁 File: `{display_filename(fname)}` ({size_str})\n"
-            f"🔧 Framework: `{framework}`\n📋 Plan: `{plan.upper()}`\n🔘 Status: {status_emoji}{resource_str}")
-    
-    keyboard = {"inline_keyboard": [
-        [{"text": "🔄 Restart", "callback_data": f"restart_deploy_{dep_id}"}],
-        [{"text": "🗑️ Delete", "callback_data": f"delete_deploy_{dep_id}"}],
-        [{"text": "🔙 Back", "callback_data": "my_deployments"}]
-    ]}
-    edit_message(chat_id, message_id, text, keyboard)
-
-def delete_deployment(deployment_id, user_id, chat_id):
+# ========== DEPLOYMENT FUNCTIONS ==========
+def deploy_from_github(chat_id, user_id, owner, repo, branch, env_vars):
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("SELECT proc_pid, file_name, user_id FROM deployments WHERE deployment_id = ?", (deployment_id,))
-        row = c.fetchone()
-        if not row:
-            send_message(chat_id, "❌ Deployment not found")
-            return False
-        proc_pid, file_name, owner_id = row
-        if owner_id != user_id and not is_admin(user_id):
-            send_message(chat_id, "❌ Permission denied")
-            return False
-        if proc_pid:
-            try:
-                kill_deployment_process(proc_pid)
-                sleep(1)
-            except:
-                pass
-        deploy_folder = get_deploy_folder(owner_id, deployment_id)
-        if deploy_folder.exists():
-            shutil.rmtree(deploy_folder)
-        c.execute("DELETE FROM deployments WHERE deployment_id = ?", (deployment_id,))
-        conn.commit()
-        conn.close()
-        with deployment_lock:
-            if deployment_id in active_deployments:
-                del active_deployments[deployment_id]
-        update_system_stats()
-        send_message(chat_id, f"✅ Deployment `{deployment_id}` deleted!")
-        return True
-    except Exception as e:
-        send_message(chat_id, f"❌ Error deleting deployment: {str(e)}")
-        return False
-
-# ========== RESTART FUNCTIONS ==========
-def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: bool = False) -> bool:
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("""SELECT file_name, file_id, requirements_file_id, requirements_text, env_vars,
-                           folder_name, source_type, github_repo, github_branch, proc_pid
-                    FROM deployments WHERE deployment_id=? AND user_id=?""", 
-                  (deployment_id, user_id))
-        row = c.fetchone()
-        if not row:
-            conn.close()
-            return False
+        deploy_id = int(datetime.now().timestamp())
+        deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(deploy_id)
+        deploy_folder.mkdir(parents=True, exist_ok=True)
         
-        file_name, file_id, req_file_id, req_text, env_vars_json, folder_name, source_type, github_repo, github_branch, old_pid = row
+        send_message(chat_id, f"⬇️ Downloading `{owner}/{repo}` from GitHub...")
         
-        if old_pid:
-            try:
-                kill_deployment_process(old_pid)
-            except Exception:
-                pass
+        url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{branch}"
+        headers = {"User-Agent": "BotHostingPlatform/1.0", "Accept": "application/vnd.github+json"}
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
         
-        deploy_folder = get_deploy_folder(user_id, deployment_id)
-        if not deploy_folder.exists():
-            deploy_folder.mkdir(parents=True, exist_ok=True)
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            tarball = resp.read()
         
-        env_vars = json.loads(env_vars_json) if env_vars_json else {}
-        
-        # For GitHub deployments, re-download
-        if source_type == 'github' and github_repo:
-            try:
-                owner, repo = github_repo.split('/')
-                token = GITHUB_TOKEN
-                url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{github_branch or 'main'}"
-                headers = {"User-Agent": "BotHostingPlatform/1.0", "Accept": "application/vnd.github+json"}
-                if token:
-                    headers["Authorization"] = f"Bearer {token}"
-                
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=120) as resp:
-                    tarball = resp.read()
-                
-                import tarfile, io
-                with tarfile.open(fileobj=io.BytesIO(tarball), mode='r:gz') as tar:
-                    members = tar.getmembers()
-                    if members:
-                        prefix = members[0].name.split('/')[0] + '/'
-                    else:
-                        prefix = ''
-                    for member in members:
-                        rel = member.name
-                        if rel.startswith(prefix):
-                            rel = rel[len(prefix):]
-                        if not rel:
-                            continue
-                        member.name = rel
-                        if rel.startswith('/') or '..' in rel:
-                            continue
-                        try:
-                            tar.extract(member, deploy_folder)
-                        except Exception:
-                            pass
-                
-                dest_script = None
-                for candidate in ['main.py', 'bot.py', 'app.py', 'run.py', 'start.py', 'index.py']:
-                    test_path = deploy_folder / candidate
-                    if test_path.exists():
-                        dest_script = test_path
-                        break
-                if not dest_script:
-                    py_files = list(deploy_folder.glob('*.py'))
-                    if py_files:
-                        dest_script = py_files[0]
-                if not dest_script:
-                    conn.close()
-                    return False
-                file_name = dest_script.name
-                file_id = None
-            except Exception as e:
-                print(f"❌ GitHub re-download error: {e}")
-                conn.close()
-                return False
-        else:
-            # For upload deployments, download from Telegram
-            if file_id:
-                try:
-                    file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": file_id})
-                    if file_info and file_info.get('ok'):
-                        file_path = file_info['result']['file_path']
-                        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-                        req = urllib.request.Request(download_url)
-                        with urllib.request.urlopen(req, timeout=60) as resp:
-                            content = resp.read()
-                        dest_script = deploy_folder / file_name
-                        dest_script.parent.mkdir(parents=True, exist_ok=True)
-                        with open(dest_script, 'wb') as f:
-                            f.write(content)
-                    else:
-                        dest_script = deploy_folder / file_name
-                        if not dest_script.exists():
-                            conn.close()
-                            return False
-                except Exception as e:
-                    print(f"❌ Failed to download main file: {e}")
-                    dest_script = deploy_folder / file_name
-                    if not dest_script.exists():
-                        conn.close()
-                        return False
+        import tarfile, io
+        with tarfile.open(fileobj=io.BytesIO(tarball), mode='r:gz') as tar:
+            members = tar.getmembers()
+            if members:
+                prefix = members[0].name.split('/')[0] + '/'
             else:
-                dest_script = deploy_folder / file_name
-                if not dest_script.exists():
-                    conn.close()
-                    return False
-            
-            if req_file_id:
+                prefix = ''
+            for member in members:
+                rel = member.name
+                if rel.startswith(prefix):
+                    rel = rel[len(prefix):]
+                if not rel:
+                    continue
+                member.name = rel
+                if rel.startswith('/') or '..' in rel:
+                    continue
                 try:
-                    file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": req_file_id})
-                    if file_info and file_info.get('ok'):
-                        file_path = file_info['result']['file_path']
-                        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-                        req = urllib.request.Request(download_url)
-                        with urllib.request.urlopen(req, timeout=60) as resp:
-                            content = resp.read()
-                        req_path = deploy_folder / 'requirements.txt'
-                        with open(req_path, 'wb') as f:
-                            f.write(content)
+                    tar.extract(member, deploy_folder)
                 except Exception:
-                    if req_text:
-                        with open(deploy_folder / 'requirements.txt', 'w') as f:
-                            f.write(req_text)
-            elif req_text:
-                with open(deploy_folder / 'requirements.txt', 'w') as f:
-                    f.write(req_text)
+                    pass
         
-        if not dest_script.exists():
-            conn.close()
+        # Find main file
+        dest_script = None
+        for candidate in ['main.py', 'bot.py', 'app.py', 'run.py', 'start.py', 'index.py']:
+            test_path = deploy_folder / candidate
+            if test_path.exists():
+                dest_script = test_path
+                break
+        if not dest_script:
+            py_files = list(deploy_folder.glob('*.py'))
+            if py_files:
+                dest_script = py_files[0]
+        
+        if not dest_script:
+            send_message(chat_id, "❌ No main Python file found in repo")
             return False
         
-        try:
-            code_content = dest_script.read_text(errors='ignore')
-        except Exception:
-            code_content = ""
+        send_message(chat_id, "📦 Installing dependencies...")
         
+        # Install dependencies
         packages_dir = deploy_folder / 'packages'
         packages_dir.mkdir(exist_ok=True)
         
-        req_file = deploy_folder / 'requirements.txt'
-        if req_file.exists():
-            install_dependencies_enhanced(req_file, packages_dir)
-        elif req_text:
-            req_file.write_text(req_text)
-            install_dependencies_enhanced(req_file, packages_dir)
+        for fname in ['requirements.txt', 'requirements-dev.txt']:
+            req_path = deploy_folder / fname
+            if req_path.exists():
+                install_dependencies_enhanced(req_path, packages_dir)
         
-        ext = dest_script.suffix.lower()
-        is_node = ext in ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
+        # Read code
+        code_content = dest_script.read_text(errors='ignore')
         
-        if is_node:
-            start_script, frameworks = create_node_launcher_script(
-                deploy_folder, dest_script, env_vars)
-        else:
-            launcher_script, frameworks = create_enhanced_launcher_script(
-                deploy_folder, dest_script, env_vars, code_content, packages_dir=packages_dir)
-            start_script = deploy_folder / "start.sh"
-            start_script.write_text(
-                f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
-                f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
-            start_script.chmod(0o755)
+        # Create launcher
+        launcher_script, frameworks = create_enhanced_launcher_script(
+            deploy_folder, dest_script, env_vars, code_content, packages_dir=packages_dir)
+        
+        start_script = deploy_folder / "start.sh"
+        start_script.write_text(
+            f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
+            f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+        start_script.chmod(0o755)
+        
+        send_message(chat_id, "🚀 Starting bot...")
         
         subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
         sleep(5)
         
         pid_file = deploy_folder / "pid.txt"
-        new_pid = None
+        proc_pid = None
         if pid_file.exists():
             try:
-                new_pid = int(pid_file.read_text().strip())
-            except Exception:
+                proc_pid = int(pid_file.read_text().strip())
+            except:
                 pass
         
         is_running = False
-        if new_pid:
+        if proc_pid:
             try:
-                os.kill(new_pid, 0)
+                os.kill(proc_pid, 0)
                 is_running = True
-            except Exception:
+            except:
                 pass
         
         if is_running:
-            conn2 = sqlite3.connect(DATABASE_FILE)
-            conn2.execute("""UPDATE deployments 
-                             SET proc_pid=?, status='active', is_paused=0,
-                                 crash_restart_count=COALESCE(crash_restart_count,0)+1,
-                                 last_crash_restart=?
-                             WHERE deployment_id=?""",
-                          (new_pid, datetime.now().isoformat(), deployment_id))
-            conn2.commit()
-            conn2.close()
+            start_time = datetime.now()
+            expire_time = start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
+            
+            conn = sqlite3.connect(DATABASE_FILE)
+            c = conn.cursor()
+            c.execute('''INSERT INTO deployments 
+                (user_id, file_name, file_size, env_vars, plan, start_time, expire_time, status, proc_pid,
+                 is_free, framework, folder_name, source_type, github_repo, github_branch)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (user_id, dest_script.name, dest_script.stat().st_size, json.dumps(env_vars),
+                 'free', start_time.isoformat(), expire_time.isoformat(), "active", proc_pid,
+                 1, ', '.join(frameworks), str(deploy_id), "github", f"{owner}/{repo}", branch))
+            deployment_db_id = c.lastrowid
+            conn.commit()
+            conn.close()
             
             with deployment_lock:
-                active_deployments[deployment_id] = new_pid
+                active_deployments[deployment_db_id] = proc_pid
             
-            if not is_auto_restart:
-                send_message(user_id, f"✅ *Bot #{deployment_id} Restarted!*")
+            send_message(chat_id,
+                f"*🎉 GITHUB DEPLOYMENT SUCCESSFUL!*\n\n"
+                f"🐙 Repo: `{owner}/{repo}`\n🌿 Branch: `{branch}`\n"
+                f"📅 Expires: `{expire_time.strftime('%Y-%m-%d %H:%M')}`\n🆔 ID: `{deployment_db_id}`",
+                {"inline_keyboard": [
+                    [{"text": "📄 View", "callback_data": f"view_deploy_{deployment_db_id}"}],
+                    [{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
+                    [{"text": "🏠 Menu", "callback_data": "main_menu"}]
+                ]})
             return True
         else:
-            conn2 = sqlite3.connect(DATABASE_FILE)
-            conn2.execute("UPDATE deployments SET status='failed' WHERE deployment_id=?", (deployment_id,))
-            conn2.commit()
-            conn2.close()
+            send_message(chat_id, "❌ Deployment failed to start. Check logs.")
             return False
-    
+            
     except Exception as e:
-        print(f"❌ Restart error: {e}")
-        traceback.print_exc()
+        send_message(chat_id, f"❌ GitHub deployment error: {e}")
+        return False
+
+def deploy_with_logs(chat_id, user_id, temp_file, req_text, req_file_id, env_vars, file_id,
+                    plan, duration, cost_coins, cost_stars, payment_method):
+    try:
+        deploy_id = int(datetime.now().timestamp())
+        deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(deploy_id)
+        deploy_folder.mkdir(parents=True, exist_ok=True)
+        packages_dir = deploy_folder / 'packages'
+        packages_dir.mkdir(exist_ok=True)
+        
+        # Copy the file
+        temp_path = Path(temp_file)
+        file_name = temp_path.name
+        dest_script = deploy_folder / file_name
+        shutil.copy2(temp_path, dest_script)
+        file_size = dest_script.stat().st_size
+        
+        # Save requirements
+        req_text_saved = req_text
+        if req_file_id:
+            file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": req_file_id})
+            if file_info and file_info.get('ok'):
+                file_path = file_info['result']['file_path']
+                download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+                try:
+                    req = urllib.request.Request(download_url)
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        req_text_saved = resp.read().decode('utf-8', errors='replace')
+                        with open(deploy_folder / 'requirements.txt', 'w') as f:
+                            f.write(req_text_saved)
+                except Exception:
+                    pass
+        
+        if req_text_saved:
+            req_path = deploy_folder / 'requirements.txt'
+            if not req_path.exists():
+                with open(req_path, 'w') as f:
+                    f.write(req_text_saved)
+            install_dependencies_enhanced(req_path, packages_dir)
+        
+        # Read code
+        code_content = dest_script.read_text(errors='ignore')
+        
+        # Create env file
+        env_file = deploy_folder / ".env"
+        with open(env_file, 'w') as f:
+            for k, v in env_vars.items():
+                f.write(f"{k}={v}\n")
+        
+        # Create launcher
+        launcher_script, frameworks = create_enhanced_launcher_script(
+            deploy_folder, dest_script, env_vars, code_content, packages_dir=packages_dir)
+        
+        start_script = deploy_folder / "start.sh"
+        start_script.write_text(
+            f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
+            f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+        start_script.chmod(0o755)
+        
+        # Start
+        subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
+        sleep(5)
+        
+        pid_file = deploy_folder / "pid.txt"
+        proc_pid = None
+        if pid_file.exists():
+            try:
+                proc_pid = int(pid_file.read_text().strip())
+            except:
+                pass
+        
+        is_running = False
+        if proc_pid:
+            try:
+                os.kill(proc_pid, 0)
+                is_running = True
+            except:
+                pass
+        
+        if is_running:
+            start_time = datetime.now()
+            is_free = (plan == 'free')
+            if is_free:
+                expire_time = start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
+            else:
+                expire_time = start_time + timedelta(days=duration)
+            
+            conn = sqlite3.connect(DATABASE_FILE)
+            c = conn.cursor()
+            c.execute('''INSERT INTO deployments 
+                (user_id, file_name, file_size, file_id, requirements_file_id, requirements_text, env_vars,
+                 plan, payment_method, cost_coins, cost_stars, start_time, expire_time, status, proc_pid,
+                 is_free, framework, folder_name, source_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (user_id, file_name, file_size, file_id, req_file_id, req_text_saved or "", json.dumps(env_vars),
+                 plan, payment_method, cost_coins, cost_stars,
+                 start_time.isoformat(), expire_time.isoformat(), "active", proc_pid,
+                 1 if is_free else 0, ', '.join(frameworks), str(deploy_id), "upload"))
+            deployment_db_id = c.lastrowid
+            conn.commit()
+            conn.close()
+            
+            with deployment_lock:
+                active_deployments[deployment_db_id] = proc_pid
+            
+            Path(temp_file).unlink(missing_ok=True)
+            set_user_step(user_id, None)
+            
+            expiry_line = f"📅 *Expires:* {expire_time.strftime('%Y-%m-%d %H:%M')}"
+            duration_line = f"⏱️ *Duration:* {duration if not is_free else FREE_DEPLOYMENT_DURATION_HOURS} {'days' if not is_free else 'hours'}"
+            
+            send_message(chat_id,
+                f"*🎉 DEPLOYMENT SUCCESSFUL!*\n\n"
+                f"📁 File: `{display_filename(file_name)}`\n"
+                f"🤖 Platform: {', '.join(frameworks)}\n"
+                f"📋 Plan: {plan.upper()}\n"
+                f"{duration_line}\n{expiry_line}\n"
+                f"🆔 ID: `{deployment_db_id}`",
+                {"inline_keyboard": [
+                    [{"text": "📄 View", "callback_data": f"view_deploy_{deployment_db_id}"}],
+                    [{"text": "🔄 Restart", "callback_data": f"restart_deploy_{deployment_db_id}"}],
+                    [{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
+                    [{"text": "🏠 Menu", "callback_data": "main_menu"}]
+                ]})
+            return True
+        else:
+            error_tail = ""
+            log_file = deploy_folder / "output.log"
+            if log_file.exists():
+                error_tail = log_file.read_text(errors='replace')[-500:]
+            send_message(chat_id, f"❌ *DEPLOYMENT FAILED*\n\n```\n{error_tail}\n```")
+            Path(temp_file).unlink(missing_ok=True)
+            return False
+            
+    except Exception as e:
+        send_message(chat_id, f"❌ Deployment error: {e}")
+        Path(temp_file).unlink(missing_ok=True)
         return False
 
 # ========== DEPENDENCY INSTALLER ==========
@@ -2104,6 +1844,580 @@ def detect_bot_framework(code_content: str) -> list:
                 break
     return detected if detected else ['generic']
 
+# ========== HANDLER FUNCTIONS ==========
+def handle_deployments_list(chat_id, user_id, message_id=None):
+    if not is_user_verified(user_id):
+        send_verification_required(chat_id, user_id, "User", message_id)
+        return
+    
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT deployment_id, file_name, file_size, plan, expire_time, status, is_free, framework FROM deployments WHERE user_id = ? ORDER BY deployment_id DESC", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        keyboard = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]}
+        if message_id:
+            edit_message(chat_id, message_id, "📭 *No Deployments*", keyboard)
+        else:
+            send_message(chat_id, "📭 *No Deployments*", keyboard)
+        return
+    
+    header = "📦 *Your Deployments*\n\n"
+    keyboard = {"inline_keyboard": []}
+    for dep_id, fname, fsize, plan, exp_str, status, is_free, framework in rows:
+        if status == "active":
+            status_icon = "✅"
+        elif status == "paused":
+            status_icon = "⏸️"
+        elif status == "stopped":
+            status_icon = "🛑"
+        elif status == "failed":
+            status_icon = "❌"
+        else:
+            status_icon = "❓"
+        icon = "🆓" if is_free else "⭐"
+        size_str = format_file_size(fsize) if fsize else "Unknown"
+        clean_fname = display_filename(fname)
+        keyboard["inline_keyboard"].append([{"text": f"{icon}{status_icon} ID:{dep_id} - {clean_fname[:20]} ({size_str})", 
+                     "callback_data": f"view_deploy_{dep_id}"}])
+    
+    keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "main_menu"}])
+    
+    if message_id:
+        edit_message(chat_id, message_id, header, keyboard)
+    else:
+        send_message(chat_id, header, keyboard)
+
+def view_deployment(chat_id, message_id, user_id, dep_id):
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT file_name, file_size, plan, status, is_free, framework, env_vars, start_time, expire_time FROM deployments WHERE deployment_id = ? AND user_id = ?", (dep_id, user_id))
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        edit_message(chat_id, message_id, "❌ Not found",
+                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "my_deployments"}]]})
+        return
+    
+    fname, fsize, plan, status, is_free, framework, env_vars_json, start_str, expire_str = row
+    size_str = format_file_size(fsize) if fsize else "Unknown"
+    status_emoji = "🟢 ACTIVE" if status == "active" else "⏸️ PAUSED" if status == "paused" else "🔴 STOPPED" if status == "stopped" else "❌ FAILED"
+    
+    # Get resource usage
+    resource_str = ""
+    if status == "active":
+        conn2 = sqlite3.connect(DATABASE_FILE)
+        c2 = conn2.cursor()
+        c2.execute("SELECT proc_pid FROM deployments WHERE deployment_id=?", (dep_id,))
+        pid_row = c2.fetchone()
+        conn2.close()
+        if pid_row and pid_row[0]:
+            ram = _get_ram_usage_pid(pid_row[0])
+            cpu = _get_cpu_usage_pid(pid_row[0])
+            resource_str = f"\n💾 RAM: `{ram:.1f}MB` | CPU: `{cpu:.1f}%`"
+    
+    text = (f"*📄 DEPLOYMENT #{dep_id}*\n\n📁 File: `{display_filename(fname)}` ({size_str})\n"
+            f"🔧 Framework: `{framework}`\n📋 Plan: `{plan.upper()}`\n🔘 Status: {status_emoji}{resource_str}")
+    
+    keyboard = {"inline_keyboard": [
+        [{"text": "🔄 Restart", "callback_data": f"restart_deploy_{dep_id}"}],
+        [{"text": "🗑️ Delete", "callback_data": f"delete_deploy_{dep_id}"}],
+        [{"text": "🔙 Back", "callback_data": "my_deployments"}]
+    ]}
+    edit_message(chat_id, message_id, text, keyboard)
+
+def delete_deployment(deployment_id, user_id, chat_id):
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute("SELECT proc_pid, file_name, user_id FROM deployments WHERE deployment_id = ?", (deployment_id,))
+        row = c.fetchone()
+        if not row:
+            send_message(chat_id, "❌ Deployment not found")
+            return False
+        proc_pid, file_name, owner_id = row
+        if owner_id != user_id and not is_admin(user_id):
+            send_message(chat_id, "❌ Permission denied")
+            return False
+        if proc_pid:
+            try:
+                kill_deployment_process(proc_pid)
+                sleep(1)
+            except:
+                pass
+        deploy_folder = get_deploy_folder(owner_id, deployment_id)
+        if deploy_folder.exists():
+            shutil.rmtree(deploy_folder)
+        c.execute("DELETE FROM deployments WHERE deployment_id = ?", (deployment_id,))
+        conn.commit()
+        conn.close()
+        with deployment_lock:
+            if deployment_id in active_deployments:
+                del active_deployments[deployment_id]
+        update_system_stats()
+        send_message(chat_id, f"✅ Deployment `{deployment_id}` deleted!")
+        return True
+    except Exception as e:
+        send_message(chat_id, f"❌ Error deleting deployment: {str(e)}")
+        return False
+
+def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: bool = False) -> bool:
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute("""SELECT file_name, file_id, requirements_file_id, requirements_text, env_vars,
+                           folder_name, source_type, github_repo, github_branch, proc_pid
+                    FROM deployments WHERE deployment_id=? AND user_id=?""", 
+                  (deployment_id, user_id))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            return False
+        
+        file_name, file_id, req_file_id, req_text, env_vars_json, folder_name, source_type, github_repo, github_branch, old_pid = row
+        
+        if old_pid:
+            try:
+                kill_deployment_process(old_pid)
+            except Exception:
+                pass
+        
+        deploy_folder = get_deploy_folder(user_id, deployment_id)
+        if not deploy_folder.exists():
+            deploy_folder.mkdir(parents=True, exist_ok=True)
+        
+        env_vars = json.loads(env_vars_json) if env_vars_json else {}
+        
+        # For GitHub deployments, re-download
+        if source_type == 'github' and github_repo:
+            try:
+                owner, repo = github_repo.split('/')
+                token = GITHUB_TOKEN
+                url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{github_branch or 'main'}"
+                headers = {"User-Agent": "BotHostingPlatform/1.0", "Accept": "application/vnd.github+json"}
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+                
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    tarball = resp.read()
+                
+                import tarfile, io
+                with tarfile.open(fileobj=io.BytesIO(tarball), mode='r:gz') as tar:
+                    members = tar.getmembers()
+                    if members:
+                        prefix = members[0].name.split('/')[0] + '/'
+                    else:
+                        prefix = ''
+                    for member in members:
+                        rel = member.name
+                        if rel.startswith(prefix):
+                            rel = rel[len(prefix):]
+                        if not rel:
+                            continue
+                        member.name = rel
+                        if rel.startswith('/') or '..' in rel:
+                            continue
+                        try:
+                            tar.extract(member, deploy_folder)
+                        except Exception:
+                            pass
+                
+                dest_script = None
+                for candidate in ['main.py', 'bot.py', 'app.py', 'run.py', 'start.py', 'index.py']:
+                    test_path = deploy_folder / candidate
+                    if test_path.exists():
+                        dest_script = test_path
+                        break
+                if not dest_script:
+                    py_files = list(deploy_folder.glob('*.py'))
+                    if py_files:
+                        dest_script = py_files[0]
+                if not dest_script:
+                    conn.close()
+                    return False
+                file_name = dest_script.name
+                file_id = None
+            except Exception as e:
+                print(f"❌ GitHub re-download error: {e}")
+                conn.close()
+                return False
+        else:
+            # For upload deployments, download from Telegram
+            if file_id:
+                try:
+                    file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": file_id})
+                    if file_info and file_info.get('ok'):
+                        file_path = file_info['result']['file_path']
+                        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+                        req = urllib.request.Request(download_url)
+                        with urllib.request.urlopen(req, timeout=60) as resp:
+                            content = resp.read()
+                        dest_script = deploy_folder / file_name
+                        dest_script.parent.mkdir(parents=True, exist_ok=True)
+                        with open(dest_script, 'wb') as f:
+                            f.write(content)
+                    else:
+                        dest_script = deploy_folder / file_name
+                        if not dest_script.exists():
+                            conn.close()
+                            return False
+                except Exception as e:
+                    print(f"❌ Failed to download main file: {e}")
+                    dest_script = deploy_folder / file_name
+                    if not dest_script.exists():
+                        conn.close()
+                        return False
+            else:
+                dest_script = deploy_folder / file_name
+                if not dest_script.exists():
+                    conn.close()
+                    return False
+            
+            if req_file_id:
+                try:
+                    file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": req_file_id})
+                    if file_info and file_info.get('ok'):
+                        file_path = file_info['result']['file_path']
+                        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+                        req = urllib.request.Request(download_url)
+                        with urllib.request.urlopen(req, timeout=60) as resp:
+                            content = resp.read()
+                        req_path = deploy_folder / 'requirements.txt'
+                        with open(req_path, 'wb') as f:
+                            f.write(content)
+                except Exception:
+                    if req_text:
+                        with open(deploy_folder / 'requirements.txt', 'w') as f:
+                            f.write(req_text)
+            elif req_text:
+                with open(deploy_folder / 'requirements.txt', 'w') as f:
+                    f.write(req_text)
+        
+        if not dest_script.exists():
+            conn.close()
+            return False
+        
+        try:
+            code_content = dest_script.read_text(errors='ignore')
+        except Exception:
+            code_content = ""
+        
+        packages_dir = deploy_folder / 'packages'
+        packages_dir.mkdir(exist_ok=True)
+        
+        req_file = deploy_folder / 'requirements.txt'
+        if req_file.exists():
+            install_dependencies_enhanced(req_file, packages_dir)
+        elif req_text:
+            req_file.write_text(req_text)
+            install_dependencies_enhanced(req_file, packages_dir)
+        
+        ext = dest_script.suffix.lower()
+        is_node = ext in ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
+        
+        if is_node:
+            start_script, frameworks = create_node_launcher_script(
+                deploy_folder, dest_script, env_vars)
+        else:
+            launcher_script, frameworks = create_enhanced_launcher_script(
+                deploy_folder, dest_script, env_vars, code_content, packages_dir=packages_dir)
+            start_script = deploy_folder / "start.sh"
+            start_script.write_text(
+                f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
+                f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+            start_script.chmod(0o755)
+        
+        subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
+        sleep(5)
+        
+        pid_file = deploy_folder / "pid.txt"
+        new_pid = None
+        if pid_file.exists():
+            try:
+                new_pid = int(pid_file.read_text().strip())
+            except Exception:
+                pass
+        
+        is_running = False
+        if new_pid:
+            try:
+                os.kill(new_pid, 0)
+                is_running = True
+            except Exception:
+                pass
+        
+        if is_running:
+            conn2 = sqlite3.connect(DATABASE_FILE)
+            conn2.execute("""UPDATE deployments 
+                             SET proc_pid=?, status='active', is_paused=0,
+                                 crash_restart_count=COALESCE(crash_restart_count,0)+1,
+                                 last_crash_restart=?
+                             WHERE deployment_id=?""",
+                          (new_pid, datetime.now().isoformat(), deployment_id))
+            conn2.commit()
+            conn2.close()
+            
+            with deployment_lock:
+                active_deployments[deployment_id] = new_pid
+            
+            if not is_auto_restart:
+                send_message(user_id, f"✅ *Bot #{deployment_id} Restarted!*")
+            return True
+        else:
+            conn2 = sqlite3.connect(DATABASE_FILE)
+            conn2.execute("UPDATE deployments SET status='failed' WHERE deployment_id=?", (deployment_id,))
+            conn2.commit()
+            conn2.close()
+            return False
+    
+    except Exception as e:
+        print(f"❌ Restart error: {e}")
+        traceback.print_exc()
+        return False
+
+# ========== DEPLOYMENT HANDLERS ==========
+def handle_free_deployment(chat_id, user_id, message_id=None):
+    if not is_user_verified(user_id):
+        send_verification_required(chat_id, user_id, "User", message_id)
+        return
+    can_deploy, reason = can_use_free_deployment(user_id)
+    if not can_deploy:
+        edit_message(chat_id, message_id,
+            f"❌ *FREE DEPLOYMENT LIMIT REACHED*\n\n{reason}",
+            {"inline_keyboard": [[{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]]})
+        return
+    set_user_step(user_id, 'awaiting_file', plan='free', duration=FREE_DEPLOYMENT_DURATION_HOURS,
+                  cost_coins=0, cost_stars=0, payment_method='none')
+    text = (f"*🆓 FREE DEPLOYMENT*\n\n⏱️ Duration: `{FREE_DEPLOYMENT_DURATION_HOURS}` hours\n"
+            f"💰 Cost: FREE\n📦 Max size: `{MAX_FILE_SIZE_MB}MB`\n\n📤 *Send your Python/Node.js file*")
+    if message_id:
+        edit_message(chat_id, message_id, text,
+                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+    else:
+        send_message(chat_id, text,
+                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+
+def handle_paid_deployment(chat_id, user_id, message_id, plan, duration, cost_coins, cost_stars):
+    if not is_user_verified(user_id):
+        send_verification_required(chat_id, user_id, "User", message_id)
+        return
+    if plan == "lifetime" and not is_admin(user_id):
+        send_message(chat_id, "⛔ Lifetime deployments are admin-only.")
+        return
+    
+    set_user_step(user_id, 'awaiting_file', plan=plan, duration=duration,
+                  cost_coins=cost_coins, cost_stars=cost_stars, payment_method=None)
+    
+    if is_user_premium(user_id) or is_admin(user_id):
+        text = (f"*✨ PREMIUM BENEFIT!*\n\nYour {plan.upper()} deployment is *FREE*!\n\n"
+                f"📤 *Send your Python/Node.js file*")
+    else:
+        text = (f"*💰 {plan.capitalize()} DEPLOYMENT*\n\n⏱️ Duration: `{duration}` days\n"
+                f"⭐ Cost: `{cost_stars}⭐`\n🪙 Cost: `{cost_coins}🪙`\n\n"
+                f"📤 *Send your Python/Node.js file*")
+    
+    edit_message(chat_id, message_id, text,
+                {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "deploy_new"}]]})
+
+# ========== CALLBACK HANDLER ==========
+def handle_callback(callback):
+    callback_id = callback['id']
+    user_id = callback['from']['id']
+    message = callback.get('message', {})
+    chat_id = message.get('chat', {}).get('id')
+    message_id = message.get('message_id')
+    data = callback['data']
+    
+    answer_callback(callback_id)
+    print(f"📨 Callback: {data} from user {user_id}")
+    
+    # ========== MAIN MENU ==========
+    if data == "main_menu":
+        if is_user_verified(user_id):
+            balances = get_user_balances(user_id)
+            welcome = f"*🤖 BOT HOSTING*\n\n🪙 `{balances['coins']}` | ⭐ `{balances['stars']}`\n\nChoose:"
+            edit_message(chat_id, message_id, welcome, get_main_menu(user_id))
+        else:
+            user_info = get_user_info(user_id)
+            send_verification_required(chat_id, user_id, user_info.get('first_name', 'User'), message_id)
+        return
+    
+    # ========== ADMIN PANEL ==========
+    if data == "admin_panel":
+        if is_admin(user_id):
+            show_admin_panel(chat_id, message_id)
+        else:
+            edit_message(chat_id, message_id, "🔒 Unauthorized!")
+        return
+    
+    # ========== REFERRALS ==========
+    if data == "my_referral":
+        show_referral_menu(chat_id, user_id, message_id)
+        return
+    
+    # ========== PREMIUM SUBSCRIPTION ==========
+    if data == "subscribe_premium":
+        show_premium_menu(chat_id, user_id, message_id)
+        return
+    
+    # ========== GITHUB DEPLOYMENT ==========
+    if data == "github_deploy":
+        if not is_user_verified(user_id):
+            send_verification_required(chat_id, user_id, "User", message_id)
+            return
+        set_user_step(user_id, 'awaiting_github_url')
+        edit_message(chat_id, message_id,
+            "*🐙 DEPLOY FROM GITHUB*\n\nSend me the GitHub repository URL or shorthand:\n\n"
+            "*Examples:*\n"
+            "`https://github.com/owner/repo`\n"
+            "`owner/repo`\n"
+            "`owner/repo@branch` ← specific branch\n\n"
+            "Supports *public and private* repos.",
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+        return
+    
+    # ========== CHANNEL VERIFICATION ==========
+    if data == "check_verification":
+        if check_channel_membership(user_id):
+            mark_channel_joined(user_id)
+            if not has_accepted_tos(user_id):
+                show_tos_prompt(chat_id, user_id, message_id)
+                return
+            balances = get_user_balances(user_id)
+            edit_message(chat_id, message_id,
+                f"✅ *VERIFIED!*\n\n🪙 {balances['coins']} | ⭐ {balances['stars']}\n\nWelcome!",
+                get_main_menu(user_id))
+        else:
+            send_verification_required(chat_id, user_id, "User", message_id)
+        return
+    
+    if data == "verify_channel":
+        if check_channel_membership(user_id):
+            mark_channel_joined(user_id)
+            if not has_accepted_tos(user_id):
+                show_tos_prompt(chat_id, user_id, message_id)
+                return
+            balances = get_user_balances(user_id)
+            edit_message(chat_id, message_id,
+                f"✅ *VERIFIED!*\n\nThank you for joining {REQUIRED_CHANNEL}!",
+                get_main_menu(user_id))
+        else:
+            edit_message(chat_id, message_id,
+                f"❌ *NOT VERIFIED*\n\nPlease join {REQUIRED_CHANNEL} first.",
+                {"inline_keyboard": [[{"text": "📢 JOIN", "url": CHANNEL_LINK},
+                                      {"text": "✅ VERIFY", "callback_data": "verify_channel"}]]})
+        return
+    
+    # ========== TERMS OF SERVICE ==========
+    if data == "tos_agree":
+        mark_tos_accepted(user_id)
+        balances = get_user_balances(user_id)
+        edit_message(chat_id, message_id,
+            f"✅ *Thanks for confirming!*\n\n🪙 {balances['coins']} | ⭐ {balances['stars']}\n\nWelcome!",
+            get_main_menu(user_id))
+        return
+    
+    # ========== MY BALANCE ==========
+    if data == "my_balance":
+        balances = get_user_balances(user_id)
+        is_premium = is_user_premium(user_id)
+        used_free = get_free_deployment_used_count(user_id)
+        free_remaining = FREE_USER_MAX_DEPLOYMENTS - used_free
+        text = (f"*💰 YOUR BALANCE*\n\n🪙 Coins: `{balances['coins']}`\n⭐ Stars: `{balances['stars']}`\n"
+                f"🎫 Status: {'⭐ PREMIUM' if is_premium else '🆓 FREE'}\n"
+                f"🆓 Free Slots: `{free_remaining}/{FREE_USER_MAX_DEPLOYMENTS}`")
+        edit_message(chat_id, message_id, text,
+                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]})
+        return
+    
+    # ========== REDEEM CODE ==========
+    if data == "redeem_code":
+        set_user_step(user_id, 'awaiting_redeem', waiting_for_redeem=1)
+        send_message(chat_id, f"*🎫 REDEEM CODE*\n\nSend your code:",
+                    {"inline_keyboard": [[{"text": "🔙 Cancel", "callback_data": "main_menu"}]]})
+        return
+    
+    # ========== DEPLOY NEW ==========
+    if data == "deploy_new":
+        if not is_user_verified(user_id):
+            send_verification_required(chat_id, user_id, "User", message_id)
+            return
+        edit_message(chat_id, message_id, "*💰 DEPLOYMENT OPTIONS*\n\nChoose your plan:",
+                    get_deploy_menu(user_id))
+        return
+    
+    if data == "plan_monthly":
+        handle_paid_deployment(chat_id, user_id, message_id, "monthly", 30, PRICE_MONTHLY_COINS, PRICE_MONTHLY_STARS)
+        return
+    
+    if data == "plan_yearly":
+        handle_paid_deployment(chat_id, user_id, message_id, "yearly", 365, PRICE_YEARLY_COINS, PRICE_YEARLY_STARS)
+        return
+    
+    if data == "plan_lifetime":
+        if not is_admin(user_id):
+            answer_callback(callback_id, "⛔ Admins only", show_alert=True)
+            return
+        handle_paid_deployment(chat_id, user_id, message_id, "lifetime", 0, 0, 0)
+        return
+    
+    # ========== FREE DEPLOYMENT ==========
+    if data == "free_deployment":
+        handle_free_deployment(chat_id, user_id, message_id)
+        return
+    
+    # ========== MY DEPLOYMENTS ==========
+    if data == "my_deployments":
+        handle_deployments_list(chat_id, user_id, message_id)
+        return
+    
+    if data.startswith("view_deploy_"):
+        dep_id = int(data.split("_")[2])
+        view_deployment(chat_id, message_id, user_id, dep_id)
+        return
+    
+    if data.startswith("restart_deploy_"):
+        dep_id = int(data.split("_")[2])
+        send_message(chat_id, f"🔄 Restarting deployment #{dep_id}...")
+        success = restart_deployment_by_id(dep_id, user_id, is_auto_restart=False)
+        if success:
+            send_message(chat_id, f"✅ Deployment #{dep_id} restarted successfully!")
+        else:
+            send_message(chat_id, f"❌ Failed to restart deployment #{dep_id}")
+        return
+    
+    if data.startswith("delete_deploy_"):
+        dep_id = int(data.split("_")[2])
+        keyboard = {"inline_keyboard": [
+            [{"text": "✅ Yes, Delete", "callback_data": f"confirm_delete_{dep_id}"},
+             {"text": "❌ No", "callback_data": f"view_deploy_{dep_id}"}]
+        ]}
+        edit_message(chat_id, message_id,
+            f"*⚠️ DELETE DEPLOYMENT*\n\nDelete deployment `{dep_id}`?\n\n⚠️ Cannot be undone!",
+            keyboard)
+        return
+    
+    if data.startswith("confirm_delete_"):
+        dep_id = int(data.split("_")[2])
+        delete_deployment(dep_id, user_id, chat_id)
+        handle_deployments_list(chat_id, user_id, message_id)
+        return
+    
+    # ========== BUG REPORT ==========
+    if data == "report_bug":
+        if not is_user_verified(user_id):
+            send_verification_required(chat_id, user_id, "User", message_id)
+            return
+        set_user_step(user_id, 'awaiting_bug_report')
+        edit_message(chat_id, message_id,
+            "*🐛 REPORT A BUG*\n\nPlease describe the issue:\n\nType your report and send it:",
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+        return
+
 # ========== MESSAGE HANDLER ==========
 def handle_message(message):
     chat_id = message['chat']['id']
@@ -2143,7 +2457,6 @@ def handle_message(message):
         
         # GitHub URL
         if user_step.get('step') == 'awaiting_github_url':
-            # Parse GitHub URL
             raw = text.strip()
             if 'github.com' in raw:
                 parts = raw.split('github.com/')
@@ -2175,7 +2488,6 @@ def handle_message(message):
                     if '=' in line:
                         k, v = line.split('=', 1)
                         env_vars[k.strip()] = v.strip()
-            # Deploy from GitHub
             owner = user_step.get('temp_github_owner')
             repo = user_step.get('temp_github_repo')
             branch = user_step.get('temp_github_branch', 'main')
@@ -2205,7 +2517,6 @@ def handle_message(message):
             
             set_user_step(user_id, None)
             
-            # Deploy the bot
             deploy_with_logs(chat_id, user_id, temp_file, req_text, req_file_id, env_vars, file_id,
                            plan, duration, cost_coins, cost_stars, payment_method)
             return
@@ -2316,281 +2627,6 @@ def handle_message(message):
         send_verification_required(chat_id, user_id, first_name, None)
     else:
         send_message(chat_id, "❌ Please use the buttons below.", get_main_menu(user_id))
-
-# ========== DEPLOYMENT FUNCTIONS ==========
-def deploy_from_github(chat_id, user_id, owner, repo, branch, env_vars):
-    try:
-        # Create deployment
-        deploy_id = int(datetime.now().timestamp())
-        deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(deploy_id)
-        deploy_folder.mkdir(parents=True, exist_ok=True)
-        
-        # Download repo
-        url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{branch}"
-        headers = {"User-Agent": "BotHostingPlatform/1.0", "Accept": "application/vnd.github+json"}
-        if GITHUB_TOKEN:
-            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-        
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            tarball = resp.read()
-        
-        import tarfile, io
-        with tarfile.open(fileobj=io.BytesIO(tarball), mode='r:gz') as tar:
-            members = tar.getmembers()
-            if members:
-                prefix = members[0].name.split('/')[0] + '/'
-            else:
-                prefix = ''
-            for member in members:
-                rel = member.name
-                if rel.startswith(prefix):
-                    rel = rel[len(prefix):]
-                if not rel:
-                    continue
-                member.name = rel
-                if rel.startswith('/') or '..' in rel:
-                    continue
-                try:
-                    tar.extract(member, deploy_folder)
-                except Exception:
-                    pass
-        
-        # Find main file
-        dest_script = None
-        for candidate in ['main.py', 'bot.py', 'app.py', 'run.py', 'start.py', 'index.py']:
-            test_path = deploy_folder / candidate
-            if test_path.exists():
-                dest_script = test_path
-                break
-        if not dest_script:
-            py_files = list(deploy_folder.glob('*.py'))
-            if py_files:
-                dest_script = py_files[0]
-        
-        if not dest_script:
-            send_message(chat_id, "❌ No main Python file found in repo")
-            return False
-        
-        # Install dependencies
-        packages_dir = deploy_folder / 'packages'
-        packages_dir.mkdir(exist_ok=True)
-        install_from_repo_requirements(deploy_folder, packages_dir)
-        
-        # Read code
-        code_content = dest_script.read_text(errors='ignore')
-        
-        # Create launcher
-        launcher_script, frameworks = create_enhanced_launcher_script(
-            deploy_folder, dest_script, env_vars, code_content, packages_dir=packages_dir)
-        
-        start_script = deploy_folder / "start.sh"
-        start_script.write_text(
-            f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
-            f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
-        start_script.chmod(0o755)
-        
-        # Start
-        subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
-        sleep(5)
-        
-        pid_file = deploy_folder / "pid.txt"
-        proc_pid = None
-        if pid_file.exists():
-            try:
-                proc_pid = int(pid_file.read_text().strip())
-            except:
-                pass
-        
-        is_running = False
-        if proc_pid:
-            try:
-                os.kill(proc_pid, 0)
-                is_running = True
-            except:
-                pass
-        
-        if is_running:
-            start_time = datetime.now()
-            expire_time = start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
-            
-            conn = sqlite3.connect(DATABASE_FILE)
-            c = conn.cursor()
-            c.execute('''INSERT INTO deployments 
-                (user_id, file_name, file_size, env_vars, plan, start_time, expire_time, status, proc_pid,
-                 is_free, framework, folder_name, source_type, github_repo, github_branch)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                (user_id, dest_script.name, dest_script.stat().st_size, json.dumps(env_vars),
-                 'free', start_time.isoformat(), expire_time.isoformat(), "active", proc_pid,
-                 1, ', '.join(frameworks), str(deploy_id), "github", f"{owner}/{repo}", branch))
-            deployment_db_id = c.lastrowid
-            conn.commit()
-            conn.close()
-            
-            with deployment_lock:
-                active_deployments[deployment_db_id] = proc_pid
-            
-            send_message(chat_id,
-                f"*🎉 GITHUB DEPLOYMENT SUCCESSFUL!*\n\n"
-                f"🐙 Repo: `{owner}/{repo}`\n🌿 Branch: `{branch}`\n"
-                f"📅 Expires: `{expire_time.strftime('%Y-%m-%d %H:%M')}`\n🆔 ID: `{deployment_db_id}`",
-                {"inline_keyboard": [
-                    [{"text": "📄 Logs", "callback_data": f"view_deploy_{deployment_db_id}"}],
-                    [{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
-                    [{"text": "🏠 Menu", "callback_data": "main_menu"}]
-                ]})
-            return True
-        else:
-            send_message(chat_id, "❌ Deployment failed to start. Check logs.")
-            return False
-            
-    except Exception as e:
-        send_message(chat_id, f"❌ GitHub deployment error: {e}")
-        return False
-
-def install_from_repo_requirements(deploy_folder, packages_dir):
-    for fname in ['requirements.txt', 'requirements-dev.txt']:
-        req_path = deploy_folder / fname
-        if req_path.exists():
-            install_dependencies_enhanced(req_path, packages_dir)
-
-def deploy_with_logs(chat_id, user_id, temp_file, req_text, req_file_id, env_vars, file_id,
-                    plan, duration, cost_coins, cost_stars, payment_method):
-    try:
-        deploy_id = int(datetime.now().timestamp())
-        deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(deploy_id)
-        deploy_folder.mkdir(parents=True, exist_ok=True)
-        packages_dir = deploy_folder / 'packages'
-        packages_dir.mkdir(exist_ok=True)
-        
-        # Get file info from temp_file
-        temp_path = Path(temp_file)
-        file_name = temp_path.name
-        dest_script = deploy_folder / file_name
-        shutil.copy2(temp_path, dest_script)
-        file_size = dest_script.stat().st_size
-        
-        # Save requirements
-        req_text_saved = req_text
-        if req_file_id:
-            file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": req_file_id})
-            if file_info and file_info.get('ok'):
-                file_path = file_info['result']['file_path']
-                download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-                try:
-                    req = urllib.request.Request(download_url)
-                    with urllib.request.urlopen(req, timeout=60) as resp:
-                        req_text_saved = resp.read().decode('utf-8', errors='replace')
-                        with open(deploy_folder / 'requirements.txt', 'w') as f:
-                            f.write(req_text_saved)
-                except Exception:
-                    pass
-        
-        if req_text_saved:
-            req_path = deploy_folder / 'requirements.txt'
-            if not req_path.exists():
-                with open(req_path, 'w') as f:
-                    f.write(req_text_saved)
-            install_dependencies_enhanced(req_path, packages_dir)
-        
-        # Read code
-        code_content = dest_script.read_text(errors='ignore')
-        
-        # Create env file
-        env_file = deploy_folder / ".env"
-        with open(env_file, 'w') as f:
-            for k, v in env_vars.items():
-                f.write(f"{k}={v}\n")
-        
-        # Create launcher
-        launcher_script, frameworks = create_enhanced_launcher_script(
-            deploy_folder, dest_script, env_vars, code_content, packages_dir=packages_dir)
-        
-        start_script = deploy_folder / "start.sh"
-        start_script.write_text(
-            f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
-            f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
-        start_script.chmod(0o755)
-        
-        # Start
-        subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
-        sleep(5)
-        
-        pid_file = deploy_folder / "pid.txt"
-        proc_pid = None
-        if pid_file.exists():
-            try:
-                proc_pid = int(pid_file.read_text().strip())
-            except:
-                pass
-        
-        is_running = False
-        if proc_pid:
-            try:
-                os.kill(proc_pid, 0)
-                is_running = True
-            except:
-                pass
-        
-        if is_running:
-            start_time = datetime.now()
-            is_free = (plan == 'free')
-            if is_free:
-                expire_time = start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
-            else:
-                expire_time = start_time + timedelta(days=duration)
-            
-            conn = sqlite3.connect(DATABASE_FILE)
-            c = conn.cursor()
-            c.execute('''INSERT INTO deployments 
-                (user_id, file_name, file_size, file_id, requirements_file_id, requirements_text, env_vars,
-                 plan, payment_method, cost_coins, cost_stars, start_time, expire_time, status, proc_pid,
-                 is_free, framework, folder_name, source_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                (user_id, file_name, file_size, file_id, req_file_id, req_text_saved or "", json.dumps(env_vars),
-                 plan, payment_method, cost_coins, cost_stars,
-                 start_time.isoformat(), expire_time.isoformat(), "active", proc_pid,
-                 1 if is_free else 0, ', '.join(frameworks), str(deploy_id), "upload"))
-            deployment_db_id = c.lastrowid
-            conn.commit()
-            conn.close()
-            
-            with deployment_lock:
-                active_deployments[deployment_db_id] = proc_pid
-            
-            Path(temp_file).unlink(missing_ok=True)
-            set_user_step(user_id, None)
-            
-            expiry_line = f"📅 *Expires:* {expire_time.strftime('%Y-%m-%d %H:%M')}"
-            duration_line = f"⏱️ *Duration:* {duration if not is_free else FREE_DEPLOYMENT_DURATION_HOURS} {'days' if not is_free else 'hours'}"
-            
-            send_message(chat_id,
-                f"*🎉 DEPLOYMENT SUCCESSFUL!*\n\n"
-                f"📁 File: `{display_filename(file_name)}`\n"
-                f"🤖 Platform: {', '.join(frameworks)}\n"
-                f"📋 Plan: {plan.upper()}\n"
-                f"{duration_line}\n{expiry_line}\n"
-                f"🆔 ID: `{deployment_db_id}`",
-                {"inline_keyboard": [
-                    [{"text": "📄 Logs", "callback_data": f"view_deploy_{deployment_db_id}"}],
-                    [{"text": "🔄 Restart", "callback_data": f"restart_deploy_{deployment_db_id}"}],
-                    [{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
-                    [{"text": "🏠 Menu", "callback_data": "main_menu"}]
-                ]})
-            return True
-        else:
-            error_tail = ""
-            log_file = deploy_folder / "output.log"
-            if log_file.exists():
-                error_tail = log_file.read_text(errors='replace')[-500:]
-            send_message(chat_id, f"❌ *DEPLOYMENT FAILED*\n\n```\n{error_tail}\n```")
-            Path(temp_file).unlink(missing_ok=True)
-            return False
-            
-    except Exception as e:
-        send_message(chat_id, f"❌ Deployment error: {e}")
-        Path(temp_file).unlink(missing_ok=True)
-        return False
 
 # ========== START HANDLER ==========
 def handle_start(chat_id, user_id, username, first_name, start_param=""):
