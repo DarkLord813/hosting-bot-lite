@@ -290,7 +290,10 @@ def init_db():
         referred_by INTEGER DEFAULT NULL,
         total_referrals INTEGER DEFAULT 0,
         pending_json TEXT DEFAULT '{}',
-        tos_accepted INTEGER DEFAULT 0
+        tos_accepted INTEGER DEFAULT 0,
+        temp_github_owner TEXT,
+        temp_github_repo TEXT,
+        temp_github_branch TEXT
     )''')
     
     # Deployments table
@@ -1056,7 +1059,8 @@ def set_user_step(user_id, step, **kwargs):
         'env_vars', 'plan', 'payment_method', 'duration', 'cost_coins', 'cost_stars',
         'waiting_for_env', 'waiting_for_reqs', 'waiting_for_redeem', 
         'temp_target_user', 'temp_coins_amount', 'temp_stars_amount', 
-        'temp_expiry', 'temp_reward_type'
+        'temp_expiry', 'temp_reward_type', 'temp_github_owner', 'temp_github_repo',
+        'temp_github_branch'
     }
     
     updates = ["step = ?"]
@@ -1112,6 +1116,7 @@ def get_user_step(user_id):
         'waiting_for_env': 0, 'waiting_for_reqs': 0, 'waiting_for_redeem': 0,
         'temp_target_user': None, 'temp_coins_amount': None,
         'temp_stars_amount': None, 'temp_expiry': None, 'temp_reward_type': None,
+        'temp_github_owner': None, 'temp_github_repo': None, 'temp_github_branch': None,
     }
     
     if not row:
@@ -1274,7 +1279,7 @@ def show_premium_menu(chat_id, user_id, message_id=None):
     else:
         send_message(chat_id, text, keyboard)
 
-# ========== ADMIN PANEL ==========
+# ========== ADMIN FUNCTIONS ==========
 def show_admin_panel(chat_id, message_id):
     stats = get_system_stats()
     text = (f"*🔧 ADMIN PANEL*\n\n"
@@ -1295,6 +1300,374 @@ def show_admin_panel(chat_id, message_id):
         ]
     }
     edit_message(chat_id, message_id, text, keyboard)
+
+def admin_list_users(chat_id, message_id):
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute('''SELECT user_id, username, first_name, coins_balance, stars_balance, is_premium, join_date
+                 FROM users ORDER BY join_date DESC LIMIT 30''')
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        text = "👥 No users found."
+    else:
+        text = "*👥 USERS (last 30)*\n\n"
+        for uid, username, first, coins, stars, premium, join_date in rows:
+            premium_icon = "⭐" if premium else "🆓"
+            join_short = join_date[:10] if join_date else "Unknown"
+            name = first or username or str(uid)
+            text += f"• `{uid}` - {name[:20]}\n"
+            text += f"  🪙{coins} ⭐{stars} | {premium_icon} | Joined: {join_short}\n\n"
+    
+    keyboard = {"inline_keyboard": [[{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]}
+    edit_message(chat_id, message_id, text[:4000], keyboard)
+
+def admin_list_deployments(chat_id, message_id):
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute('''SELECT deployment_id, user_id, file_name, plan, status, start_time, expire_time, is_free
+                 FROM deployments ORDER BY deployment_id DESC LIMIT 30''')
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        text = "📭 No deployments found."
+    else:
+        text = "*📋 DEPLOYMENTS (last 30)*\n\n"
+        for dep_id, uid, fname, plan, status, start, expire, is_free in rows:
+            status_icon = "✅" if status == "active" else "⏸️" if status == "paused" else "🛑" if status == "stopped" else "❌"
+            icon = "🆓" if is_free else "⭐"
+            start_short = start[:10] if start else "N/A"
+            expire_short = expire[:10] if expire else "Never"
+            text += f"• #{dep_id} - `{uid}` - {display_filename(fname)[:20]}\n"
+            text += f"  {icon} {plan.upper()} | {status_icon} | {start_short} → {expire_short}\n\n"
+    
+    keyboard = {"inline_keyboard": [[{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]}
+    edit_message(chat_id, message_id, text[:4000], keyboard)
+
+def admin_create_code(chat_id, message_id):
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "100 🪙", "callback_data": "create_code_100"},
+             {"text": "500 🪙", "callback_data": "create_code_500"}],
+            [{"text": "1000 🪙", "callback_data": "create_code_1000"},
+             {"text": "5000 🪙", "callback_data": "create_code_5000"}],
+            [{"text": "10000 🪙", "callback_data": "create_code_10000"},
+             {"text": "50000 🪙", "callback_data": "create_code_50000"}],
+            [{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]
+        ]
+    }
+    edit_message(chat_id, message_id, "*🎫 CREATE REDEEM CODE*\n\nSelect amount:", keyboard)
+
+def admin_create_code_amount(admin_id, amount, chat_id, message_id):
+    set_user_step(admin_id, 'awaiting_code_uses', temp_code_amount=amount)
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "1 use", "callback_data": "code_uses_1"},
+             {"text": "5 uses", "callback_data": "code_uses_5"}],
+            [{"text": "10 uses", "callback_data": "code_uses_10"},
+             {"text": "50 uses", "callback_data": "code_uses_50"}],
+            [{"text": "100 uses", "callback_data": "code_uses_100"},
+             {"text": "♾️ Unlimited", "callback_data": "code_uses_0"}],
+            [{"text": "🔙 Back", "callback_data": "admin_create_code"}]
+        ]
+    }
+    text = f"*🎫 CREATE REDEEM CODE*\n\n💰 Amount: `{amount}🪙`\n\nHow many times can this code be used?"
+    edit_message(chat_id, message_id, text, keyboard)
+
+def admin_code_max_uses(admin_id, max_uses, chat_id, message_id):
+    set_user_step(admin_id, 'awaiting_code_expiry', temp_code_max_uses=max_uses)
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "1 day", "callback_data": "code_expiry_1"},
+             {"text": "7 days", "callback_data": "code_expiry_7"}],
+            [{"text": "30 days", "callback_data": "code_expiry_30"},
+             {"text": "90 days", "callback_data": "code_expiry_90"}],
+            [{"text": "365 days", "callback_data": "code_expiry_365"},
+             {"text": "♾️ Never expires", "callback_data": "code_expiry_36500"}],
+            [{"text": "🔙 Back", "callback_data": "admin_create_code"}]
+        ]
+    }
+    uses_label = "Unlimited" if max_uses == 0 else str(max_uses)
+    text = f"*🎫 CREATE REDEEM CODE*\n\n🔢 Max uses: `{uses_label}`\n\nHow many days until this code expires?"
+    edit_message(chat_id, message_id, text, keyboard)
+
+def admin_code_expiry(admin_id, expiry_days, chat_id, message_id):
+    user_step = get_user_step(admin_id)
+    amount = user_step.get('temp_code_amount')
+    max_uses = user_step.get('temp_code_max_uses')
+    
+    if not amount or max_uses is None:
+        edit_message(chat_id, message_id, "❌ Session expired. Please start over.",
+                    {"inline_keyboard": [[{"text": "🔙 Try Again", "callback_data": "admin_create_code"}]])
+        return
+    
+    set_user_step(admin_id, None)
+    code = create_redeem_code(admin_id, amount, 0, expiry_days, max_uses)
+    
+    uses_label = "Unlimited" if max_uses == 0 else f"{max_uses} use(s)"
+    expiry_label = "Never expires" if expiry_days >= 36500 else f"{expiry_days} day(s)"
+    
+    text = (f"✅ *CODE CREATED!*\n\n🎫 `{code}`\n💰 {amount}🪙\n📅 {expiry_label}\n🔢 {uses_label}\n\nShare with users!")
+    keyboard = {"inline_keyboard": [[{"text": "🎫 Create Another", "callback_data": "admin_create_code"},
+                                     {"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]}
+    edit_message(chat_id, message_id, text, keyboard)
+
+def admin_add_coins(chat_id, message_id):
+    set_user_step(admin_id, 'awaiting_coins_target')
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "1", "callback_data": "target_digit_1"}, {"text": "2", "callback_data": "target_digit_2"}, {"text": "3", "callback_data": "target_digit_3"}],
+            [{"text": "4", "callback_data": "target_digit_4"}, {"text": "5", "callback_data": "target_digit_5"}, {"text": "6", "callback_data": "target_digit_6"}],
+            [{"text": "7", "callback_data": "target_digit_7"}, {"text": "8", "callback_data": "target_digit_8"}, {"text": "9", "callback_data": "target_digit_9"}],
+            [{"text": "0", "callback_data": "target_digit_0"}, {"text": "⌫", "callback_data": "target_backspace"}, {"text": "✅", "callback_data": "target_confirm"}],
+            [{"text": "📋 Use My ID", "callback_data": "use_my_id_target"}],
+            [{"text": "❌ Cancel", "callback_data": "admin_panel"}]
+        ]
+    }
+    edit_message(chat_id, message_id,
+        f"*🪙 ADD COINS*\n\nEnter the *User ID* using the number pad below:\n\n*User ID:* ` `",
+        keyboard)
+
+def admin_target_digit(admin_id, digit, chat_id, message_id):
+    user_step = get_user_step(admin_id)
+    current_target = user_step.get('temp_target_user') or ""
+    
+    if digit == 'backspace':
+        new_target = current_target[:-1]
+    else:
+        new_target = current_target + str(digit)
+    
+    set_user_step(admin_id, 'awaiting_coins_target', temp_target_user=new_target)
+    
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "1", "callback_data": "target_digit_1"}, {"text": "2", "callback_data": "target_digit_2"}, {"text": "3", "callback_data": "target_digit_3"}],
+            [{"text": "4", "callback_data": "target_digit_4"}, {"text": "5", "callback_data": "target_digit_5"}, {"text": "6", "callback_data": "target_digit_6"}],
+            [{"text": "7", "callback_data": "target_digit_7"}, {"text": "8", "callback_data": "target_digit_8"}, {"text": "9", "callback_data": "target_digit_9"}],
+            [{"text": "0", "callback_data": "target_digit_0"}, {"text": "⌫", "callback_data": "target_backspace"}, {"text": "✅", "callback_data": "target_confirm"}],
+            [{"text": "📋 Use My ID", "callback_data": "use_my_id_target"}],
+            [{"text": "❌ Cancel", "callback_data": "admin_panel"}]
+        ]
+    }
+    
+    display_target = new_target if new_target else " "
+    edit_message(chat_id, message_id,
+        f"*🪙 ADD COINS*\n\nEnter the *User ID* using the number pad below:\n\n*User ID:* `{display_target}`",
+        keyboard)
+
+def admin_target_confirm(admin_id, chat_id, message_id):
+    user_step = get_user_step(admin_id)
+    target_user_id = user_step.get('temp_target_user')
+    
+    if not target_user_id or not target_user_id.strip():
+        edit_message(chat_id, message_id,
+            f"❌ *No User ID entered!*",
+            {"inline_keyboard": [[{"text": "🔙 Try Again", "callback_data": "admin_add_coins"}]])
+        return
+    
+    try:
+        target_user_id = int(target_user_id)
+    except ValueError:
+        edit_message(chat_id, message_id,
+            f"❌ *Invalid User ID!*",
+            {"inline_keyboard": [[{"text": "🔙 Try Again", "callback_data": "admin_add_coins"}]])
+        return
+    
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT first_name FROM users WHERE user_id = ?", (target_user_id,))
+    user = c.fetchone()
+    conn.close()
+    
+    if not user:
+        edit_message(chat_id, message_id,
+            f"❌ *User not found!*\n\nUser ID `{target_user_id}` does not exist.",
+            {"inline_keyboard": [[{"text": "🔙 Try Again", "callback_data": "admin_add_coins"}]])
+        return
+    
+    first_name = user[0] or "User"
+    set_user_step(admin_id, 'awaiting_coins_amount', temp_target_user=str(target_user_id), temp_coins_amount=0)
+    
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "1", "callback_data": "coin_digit_1"}, {"text": "2", "callback_data": "coin_digit_2"}, {"text": "3", "callback_data": "coin_digit_3"}],
+            [{"text": "4", "callback_data": "coin_digit_4"}, {"text": "5", "callback_data": "coin_digit_5"}, {"text": "6", "callback_data": "coin_digit_6"}],
+            [{"text": "7", "callback_data": "coin_digit_7"}, {"text": "8", "callback_data": "coin_digit_8"}, {"text": "9", "callback_data": "coin_digit_9"}],
+            [{"text": "0", "callback_data": "coin_digit_0"}, {"text": "⌫", "callback_data": "coin_backspace"}, {"text": "✅", "callback_data": "coin_confirm"}],
+            [{"text": "100", "callback_data": "coin_preset_100"}, {"text": "500", "callback_data": "coin_preset_500"}],
+            [{"text": "1000", "callback_data": "coin_preset_1000"}, {"text": "5000", "callback_data": "coin_preset_5000"}],
+            [{"text": "🔙 Back", "callback_data": "admin_add_coins"}]
+        ]
+    }
+    
+    edit_message(chat_id, message_id,
+        f"*🪙 ADD COINS*\n\nTarget user: `{target_user_id}` ({first_name})\n"
+        f"Current balance: `{get_user_balances(target_user_id)['coins']}🪙`\n\n"
+        f"Enter the amount:\n\nAmount: `0` 🪙",
+        keyboard)
+
+def admin_coin_digit(admin_id, digit, chat_id, message_id):
+    user_step = get_user_step(admin_id)
+    current_amount = user_step.get('temp_coins_amount') or 0
+    target_user_id = user_step.get('temp_target_user')
+    
+    if digit == 'backspace':
+        new_amount = current_amount // 10
+    else:
+        new_amount = current_amount * 10 + digit
+    
+    set_user_step(admin_id, 'awaiting_coins_amount', 
+                  temp_target_user=target_user_id, 
+                  temp_coins_amount=new_amount)
+    
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT first_name FROM users WHERE user_id = ?", (int(target_user_id),))
+    user = c.fetchone()
+    conn.close()
+    first_name = user[0] if user else "User"
+    
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "1", "callback_data": "coin_digit_1"}, {"text": "2", "callback_data": "coin_digit_2"}, {"text": "3", "callback_data": "coin_digit_3"}],
+            [{"text": "4", "callback_data": "coin_digit_4"}, {"text": "5", "callback_data": "coin_digit_5"}, {"text": "6", "callback_data": "coin_digit_6"}],
+            [{"text": "7", "callback_data": "coin_digit_7"}, {"text": "8", "callback_data": "coin_digit_8"}, {"text": "9", "callback_data": "coin_digit_9"}],
+            [{"text": "0", "callback_data": "coin_digit_0"}, {"text": "⌫", "callback_data": "coin_backspace"}, {"text": "✅", "callback_data": "coin_confirm"}],
+            [{"text": "100", "callback_data": "coin_preset_100"}, {"text": "500", "callback_data": "coin_preset_500"}],
+            [{"text": "1000", "callback_data": "coin_preset_1000"}, {"text": "5000", "callback_data": "coin_preset_5000"}],
+            [{"text": "🔙 Back", "callback_data": "admin_add_coins"}]
+        ]
+    }
+    
+    edit_message(chat_id, message_id,
+        f"*🪙 ADD COINS*\n\nTarget user: `{target_user_id}` ({first_name})\n"
+        f"Current balance: `{get_user_balances(int(target_user_id))['coins']}🪙`\n\n"
+        f"Amount: `{new_amount}` 🪙",
+        keyboard)
+
+def admin_coin_preset(admin_id, preset_amount, chat_id, message_id):
+    user_step = get_user_step(admin_id)
+    target_user_id = user_step.get('temp_target_user')
+    
+    if not target_user_id:
+        edit_message(chat_id, message_id, "❌ Session expired.",
+                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_add_coins"}]])
+        return
+    
+    set_user_step(admin_id, 'awaiting_coins_amount', 
+                  temp_target_user=target_user_id, 
+                  temp_coins_amount=preset_amount)
+    
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT first_name FROM users WHERE user_id = ?", (int(target_user_id),))
+    user = c.fetchone()
+    conn.close()
+    first_name = user[0] if user else "User"
+    
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "1", "callback_data": "coin_digit_1"}, {"text": "2", "callback_data": "coin_digit_2"}, {"text": "3", "callback_data": "coin_digit_3"}],
+            [{"text": "4", "callback_data": "coin_digit_4"}, {"text": "5", "callback_data": "coin_digit_5"}, {"text": "6", "callback_data": "coin_digit_6"}],
+            [{"text": "7", "callback_data": "coin_digit_7"}, {"text": "8", "callback_data": "coin_digit_8"}, {"text": "9", "callback_data": "coin_digit_9"}],
+            [{"text": "0", "callback_data": "coin_digit_0"}, {"text": "⌫", "callback_data": "coin_backspace"}, {"text": "✅", "callback_data": "coin_confirm"}],
+            [{"text": "🔙 Back", "callback_data": "admin_add_coins"}]
+        ]
+    }
+    
+    edit_message(chat_id, message_id,
+        f"*🪙 ADD COINS*\n\nTarget user: `{target_user_id}` ({first_name})\n"
+        f"Current balance: `{get_user_balances(int(target_user_id))['coins']}🪙`\n\n"
+        f"Amount preset: `{preset_amount}` 🪙",
+        keyboard)
+
+def admin_coin_confirm(admin_id, chat_id, message_id):
+    user_step = get_user_step(admin_id)
+    target_user_id = user_step.get('temp_target_user')
+    amount = user_step.get('temp_coins_amount')
+    
+    if not target_user_id or not amount or amount <= 0:
+        edit_message(chat_id, message_id, "❌ Invalid amount.",
+                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_add_coins"}]])
+        return
+    
+    set_user_step(admin_id, None, temp_target_user=None, temp_coins_amount=None)
+    
+    try:
+        update_user_coins(int(target_user_id), amount, "admin_add", f"by_admin_{admin_id}")
+        new_balance = get_user_balances(int(target_user_id))['coins']
+        
+        # Notify user
+        try:
+            send_message(int(target_user_id),
+                f"🎉 *You received {amount} Coins!*\n\nYour new balance: `{new_balance}🪙`",
+                {"inline_keyboard": [[{"text": "⭐ Get Premium", "callback_data": "subscribe_premium"}]])
+        except Exception:
+            pass
+        
+        edit_message(chat_id, message_id,
+            f"✅ *COINS ADDED SUCCESSFULLY!*\n\nUser: `{target_user_id}`\nAdded: `+{amount}🪙`\nNew balance: `{new_balance}🪙`",
+            {"inline_keyboard": [[{"text": "➕ Add More", "callback_data": "admin_add_coins"},
+                                  {"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]])
+    except Exception as e:
+        edit_message(chat_id, message_id,
+            f"❌ Failed to add coins: {e}",
+            {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]])
+        return
+
+def admin_use_my_id(admin_id, chat_id, message_id):
+    set_user_step(admin_id, 'awaiting_coins_target', temp_target_user=str(admin_id))
+    admin_target_confirm(admin_id, chat_id, message_id)
+
+def admin_broadcast(chat_id, message_id):
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "✉️ Send Text Message", "callback_data": "admin_broadcast_text"}],
+            [{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]
+        ]
+    }
+    edit_message(chat_id, message_id, "*📢 BROADCAST*\n\nChoose broadcast type:", keyboard)
+
+def admin_broadcast_send(chat_id, user_id, message_id):
+    set_user_step(user_id, 'awaiting_broadcast_text')
+    edit_message(chat_id, message_id,
+        "*✉️ TEXT BROADCAST*\n\nType the message to send to all users:\n\nSupports *bold*, _italic_, `code`",
+        {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_panel"}]])
+    return
+
+def admin_broadcast_confirm(chat_id, user_id, message_id):
+    user_step = get_user_step(user_id)
+    broadcast_text = user_step.get('temp_broadcast_text', '')
+    
+    if not broadcast_text:
+        send_message(chat_id, "❌ No message to send.")
+        return
+    
+    set_user_step(user_id, None)
+    send_message(chat_id, "📤 *Sending broadcast to all users...*")
+    
+    # Send to all users
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users")
+    users = c.fetchall()
+    conn.close()
+    
+    sent = 0
+    for uid in users:
+        try:
+            send_message(uid[0], broadcast_text)
+            sent += 1
+            sleep(0.05)  # Rate limiting
+        except Exception:
+            pass
+    
+    edit_message(chat_id, message_id,
+        f"✅ *Broadcast complete!*\n\nSent to: `{sent}` users",
+        {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]])
+    return
 
 # ========== DEPLOYMENT FUNCTIONS ==========
 def deploy_from_github(chat_id, user_id, owner, repo, branch, env_vars):
@@ -1857,7 +2230,7 @@ def handle_deployments_list(chat_id, user_id, message_id=None):
     conn.close()
     
     if not rows:
-        keyboard = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]}
+        keyboard = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]}
         if message_id:
             edit_message(chat_id, message_id, "📭 *No Deployments*", keyboard)
         else:
@@ -1883,7 +2256,7 @@ def handle_deployments_list(chat_id, user_id, message_id=None):
         keyboard["inline_keyboard"].append([{"text": f"{icon}{status_icon} ID:{dep_id} - {clean_fname[:20]} ({size_str})", 
                      "callback_data": f"view_deploy_{dep_id}"}])
     
-    keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "main_menu"}])
+    keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "main_menu"}]})
     
     if message_id:
         edit_message(chat_id, message_id, header, keyboard)
@@ -1899,7 +2272,7 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
     
     if not row:
         edit_message(chat_id, message_id, "❌ Not found",
-                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "my_deployments"}]]})
+                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "my_deployments"}]])
         return
     
     fname, fsize, plan, status, is_free, framework, env_vars_json, start_str, expire_str = row
@@ -2188,7 +2561,7 @@ def handle_free_deployment(chat_id, user_id, message_id=None):
     if not can_deploy:
         edit_message(chat_id, message_id,
             f"❌ *FREE DEPLOYMENT LIMIT REACHED*\n\n{reason}",
-            {"inline_keyboard": [[{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]]})
+            {"inline_keyboard": [[{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]])
         return
     set_user_step(user_id, 'awaiting_file', plan='free', duration=FREE_DEPLOYMENT_DURATION_HOURS,
                   cost_coins=0, cost_stars=0, payment_method='none')
@@ -2196,10 +2569,11 @@ def handle_free_deployment(chat_id, user_id, message_id=None):
             f"💰 Cost: FREE\n📦 Max size: `{MAX_FILE_SIZE_MB}MB`\n\n📤 *Send your Python/Node.js file*")
     if message_id:
         edit_message(chat_id, message_id, text,
-                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]])
     else:
         send_message(chat_id, text,
-                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]])
+    return
 
 def handle_paid_deployment(chat_id, user_id, message_id, plan, duration, cost_coins, cost_stars):
     if not is_user_verified(user_id):
@@ -2221,7 +2595,8 @@ def handle_paid_deployment(chat_id, user_id, message_id, plan, duration, cost_co
                 f"📤 *Send your Python/Node.js file*")
     
     edit_message(chat_id, message_id, text,
-                {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "deploy_new"}]]})
+                {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "deploy_new"}]])
+    return
 
 # ========== CALLBACK HANDLER ==========
 def handle_callback(callback):
@@ -2254,6 +2629,100 @@ def handle_callback(callback):
             edit_message(chat_id, message_id, "🔒 Unauthorized!")
         return
     
+    # Admin panel buttons
+    if data == "admin_list_users":
+        if is_admin(user_id):
+            admin_list_users(chat_id, message_id)
+        return
+    
+    if data == "admin_list_deployments":
+        if is_admin(user_id):
+            admin_list_deployments(chat_id, message_id)
+        return
+    
+    if data == "admin_create_code":
+        if is_admin(user_id):
+            admin_create_code(chat_id, message_id)
+        return
+    
+    if data == "admin_add_coins":
+        if is_admin(user_id):
+            admin_add_coins(chat_id, message_id)
+        return
+    
+    if data == "admin_broadcast":
+        if is_admin(user_id):
+            admin_broadcast(chat_id, message_id)
+        return
+    
+    if data == "admin_broadcast_text":
+        if is_admin(user_id):
+            admin_broadcast_send(chat_id, user_id, message_id)
+        return
+    
+    # ========== ADMIN CREATE CODE FLOW ==========
+    if data.startswith("create_code_"):
+        if is_admin(user_id):
+            amount = int(data.split("_")[2])
+            admin_create_code_amount(user_id, amount, chat_id, message_id)
+        return
+    
+    if data.startswith("code_uses_"):
+        if is_admin(user_id):
+            max_uses = int(data.split("_")[2])
+            admin_code_max_uses(user_id, max_uses, chat_id, message_id)
+        return
+    
+    if data.startswith("code_expiry_"):
+        if is_admin(user_id):
+            expiry_days = int(data.split("_")[2])
+            admin_code_expiry(user_id, expiry_days, chat_id, message_id)
+        return
+    
+    # ========== ADMIN ADD COINS FLOW ==========
+    if data.startswith("target_digit_"):
+        if is_admin(user_id):
+            digit = int(data.split("_")[2])
+            admin_target_digit(user_id, digit, chat_id, message_id)
+        return
+    
+    if data == "target_backspace":
+        if is_admin(user_id):
+            admin_target_digit(user_id, 'backspace', chat_id, message_id)
+        return
+    
+    if data == "target_confirm":
+        if is_admin(user_id):
+            admin_target_confirm(user_id, chat_id, message_id)
+        return
+    
+    if data == "use_my_id_target":
+        if is_admin(user_id):
+            admin_use_my_id(user_id, chat_id, message_id)
+        return
+    
+    if data.startswith("coin_digit_"):
+        if is_admin(user_id):
+            digit = int(data.split("_")[2])
+            admin_coin_digit(user_id, digit, chat_id, message_id)
+        return
+    
+    if data == "coin_backspace":
+        if is_admin(user_id):
+            admin_coin_digit(user_id, 'backspace', chat_id, message_id)
+        return
+    
+    if data == "coin_confirm":
+        if is_admin(user_id):
+            admin_coin_confirm(user_id, chat_id, message_id)
+        return
+    
+    if data.startswith("coin_preset_"):
+        if is_admin(user_id):
+            amount = int(data.split("_")[2])
+            admin_coin_preset(user_id, amount, chat_id, message_id)
+        return
+    
     # ========== REFERRALS ==========
     if data == "my_referral":
         show_referral_menu(chat_id, user_id, message_id)
@@ -2277,7 +2746,7 @@ def handle_callback(callback):
             "`owner/repo`\n"
             "`owner/repo@branch` ← specific branch\n\n"
             "Supports *public and private* repos.",
-            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]])
         return
     
     # ========== CHANNEL VERIFICATION ==========
@@ -2309,7 +2778,7 @@ def handle_callback(callback):
             edit_message(chat_id, message_id,
                 f"❌ *NOT VERIFIED*\n\nPlease join {REQUIRED_CHANNEL} first.",
                 {"inline_keyboard": [[{"text": "📢 JOIN", "url": CHANNEL_LINK},
-                                      {"text": "✅ VERIFY", "callback_data": "verify_channel"}]]})
+                                      {"text": "✅ VERIFY", "callback_data": "verify_channel"}]])
         return
     
     # ========== TERMS OF SERVICE ==========
@@ -2331,14 +2800,14 @@ def handle_callback(callback):
                 f"🎫 Status: {'⭐ PREMIUM' if is_premium else '🆓 FREE'}\n"
                 f"🆓 Free Slots: `{free_remaining}/{FREE_USER_MAX_DEPLOYMENTS}`")
         edit_message(chat_id, message_id, text,
-                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]})
+                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]])
         return
     
     # ========== REDEEM CODE ==========
     if data == "redeem_code":
         set_user_step(user_id, 'awaiting_redeem', waiting_for_redeem=1)
         send_message(chat_id, f"*🎫 REDEEM CODE*\n\nSend your code:",
-                    {"inline_keyboard": [[{"text": "🔙 Cancel", "callback_data": "main_menu"}]]})
+                    {"inline_keyboard": [[{"text": "🔙 Cancel", "callback_data": "main_menu"}]])
         return
     
     # ========== DEPLOY NEW ==========
@@ -2415,7 +2884,7 @@ def handle_callback(callback):
         set_user_step(user_id, 'awaiting_bug_report')
         edit_message(chat_id, message_id,
             "*🐛 REPORT A BUG*\n\nPlease describe the issue:\n\nType your report and send it:",
-            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]])
         return
 
 # ========== MESSAGE HANDLER ==========
@@ -2439,7 +2908,7 @@ def handle_message(message):
         # Redeem code
         if user_step.get('waiting_for_redeem') == 1:
             success, msg = redeem_code(user_id, text.strip())
-            send_message(chat_id, msg, {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
+            send_message(chat_id, msg, {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]])
             set_user_step(user_id, None, waiting_for_redeem=0)
             return
         
@@ -2450,7 +2919,7 @@ def handle_message(message):
                 set_user_step(user_id, None)
                 send_message(chat_id,
                     f"✅ *Bug Report #{report_id} Submitted!*\n\nThank you!",
-                    {"inline_keyboard": [[{"text": "🏠 Main Menu", "callback_data": "main_menu"}]]})
+                    {"inline_keyboard": [[{"text": "🏠 Main Menu", "callback_data": "main_menu"}]])
             else:
                 send_message(chat_id, "❌ Report cannot be empty.")
             return
@@ -2475,7 +2944,7 @@ def handle_message(message):
                         send_message(chat_id,
                             f"✅ Repo: `{owner}/{repo}`\nBranch: `{branch}`\n\nSend environment variables (KEY=VALUE) or type `skip`:",
                             {"inline_keyboard": [[{"text": "⏭️ Skip", "callback_data": "github_skip"}],
-                                                [{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+                                                [{"text": "❌ Cancel", "callback_data": "main_menu"}]])
                         return
             send_message(chat_id, "❌ Invalid GitHub URL. Try: `https://github.com/owner/repo`")
             return
@@ -2649,7 +3118,7 @@ def handle_start(chat_id, user_id, username, first_name, start_param=""):
             if credited:
                 send_message(referrer_id,
                     f"🎉 *Referral Bonus!*\n\nYou earned *{REFERRAL_REWARD_COINS} 🪙* coins.",
-                    {"inline_keyboard": [[{"text": "👥 My Referrals", "callback_data": "my_referral"}]]})
+                    {"inline_keyboard": [[{"text": "👥 My Referrals", "callback_data": "my_referral"}]])
         except Exception:
             pass
     
