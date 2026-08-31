@@ -22,6 +22,18 @@ import tempfile
 import random
 import time as time_module
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import logging
+
+# ========== SETUP LOGGING ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# ========== START TIME FOR UPTIME ==========
+START_TIME = datetime.now()
 
 # ========== CONFIGURATION ==========
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -30,10 +42,10 @@ if not BOT_TOKEN:
         BOT_TOKEN = os.environ.get(_alias, "")
         if BOT_TOKEN:
             os.environ["BOT_TOKEN"] = BOT_TOKEN
-            print(f"ℹ️  BOT_TOKEN set from {_alias}")
+            logger.info(f"BOT_TOKEN set from {_alias}")
             break
 if not BOT_TOKEN:
-    print("⚠️  WARNING: No bot token found.")
+    logger.warning("No bot token found.")
     BOT_TOKEN = "MISSING_TOKEN"
 
 admin_ids_str = os.environ.get("ADMIN_IDS", "7713987088")
@@ -109,14 +121,27 @@ server_running = True
 active_deployments = {}
 deployment_lock = threading.Lock()
 
-# ========== HEALTH CHECK SERVER ==========
-class HealthHandler(BaseHTTPRequestHandler):
+# ========== IMPROVED HEALTH CHECK SERVER ==========
+class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/health' or self.path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(b'{"status":"healthy","timestamp":"' + datetime.now().isoformat().encode() + b'"}')
+            response = json.dumps({
+                'status': 'healthy',
+                'timestamp': datetime.now().isoformat(),
+                'uptime': str(datetime.now() - START_TIME),
+                'active_deployments': len(active_deployments),
+                'last_update': LAST_UPDATE_ID,
+                'pid': os.getpid()
+            })
+            self.wfile.write(response.encode())
+        elif self.path == '/ping':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'pong')
         else:
             self.send_response(404)
             self.end_headers()
@@ -127,14 +152,40 @@ class HealthHandler(BaseHTTPRequestHandler):
 def start_health_server():
     try:
         port = int(os.environ.get("PORT", 10000))
-        server = HTTPServer(('0.0.0.0', port), HealthHandler)
+        server = HTTPServer(('0.0.0.0', port), KeepAliveHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        print(f"✅ Health check server running on port {port}")
+        logger.info(f"Health check server running on port {port}")
         return server
     except Exception as e:
-        print(f"⚠️ Health server error: {e}")
+        logger.error(f"Health server error: {e}")
         return None
+
+# ========== KEEP-ALIVE PINGER ==========
+def keep_alive_pinger():
+    """
+    Periodically pings the bot's own health endpoint and Telegram
+    to keep Render from sleeping and keep the connection alive.
+    """
+    port = int(os.environ.get("PORT", 10000))
+    url = f"http://localhost:{port}/ping"
+    
+    while True:
+        try:
+            # Ping self
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    logger.debug("Keep-alive ping successful")
+            
+            # Also ping Telegram to keep connection alive
+            http_get(f"{TELEGRAM_API}/getMe", {"timeout": 5})
+            
+        except Exception as e:
+            logger.debug(f"Keep-alive ping failed: {e}")
+        
+        # Sleep for 2 minutes (Render free tier sleeps after 15 min of inactivity)
+        sleep(120)
 
 # ========== ULTRA COMPRESSED RESOURCE MONITOR ==========
 _RESOURCE_CACHE = {}
@@ -454,7 +505,7 @@ def init_db():
     
     conn.commit()
     conn.close()
-    print("✅ Database initialized")
+    logger.info("Database initialized")
 
 # ========== HELPER FUNCTIONS ==========
 def send_message(chat_id, text, keyboard=None, parse_mode="Markdown"):
@@ -490,7 +541,7 @@ def send_message(chat_id, text, keyboard=None, parse_mode="Markdown"):
                     pass
             return None
         except Exception as e:
-            print(f"Send error (attempt {_attempt+1}): {e}")
+            logger.error(f"Send error (attempt {_attempt+1}): {e}")
             if _attempt < 2:
                 sleep(1)
     return None
@@ -530,10 +581,10 @@ def edit_message(chat_id, message_id, text, keyboard=None):
                     except Exception:
                         pass
                 return None
-            print(f"Edit HTTP {e.code}")
+            logger.error(f"Edit HTTP {e.code}")
             return None
         except Exception as e:
-            print(f"Edit error (attempt {_attempt+1}): {e}")
+            logger.error(f"Edit error (attempt {_attempt+1}): {e}")
             if _attempt < 2:
                 sleep(1)
     return None
@@ -550,7 +601,7 @@ def answer_callback(callback_id, text=None, show_alert=False):
         req = urllib.request.Request(url, data=data_bytes, headers={'Content-Type': 'application/json'})
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
-        print(f"Answer callback error: {e}")
+        logger.error(f"Answer callback error: {e}")
 
 def http_get(url, params=None):
     try:
@@ -562,7 +613,7 @@ def http_get(url, params=None):
         with urllib.request.urlopen(url, timeout=socket_timeout) as response:
             return json.loads(response.read().decode('utf-8'))
     except Exception as e:
-        print(f"HTTP error: {e}")
+        logger.error(f"HTTP error: {e}")
         return None
 
 _FILENAME_PREFIX_RE = re.compile(r'^\d{8}_\d{6}_temp_\d+_')
@@ -601,7 +652,7 @@ def notify_admin(message):
         try:
             send_message(admin_id, message)
         except Exception as e:
-            print(f"Failed to notify admin {admin_id}: {e}")
+            logger.error(f"Failed to notify admin {admin_id}: {e}")
 
 # ========== USER FUNCTIONS ==========
 def get_user_info(user_id):
@@ -636,7 +687,7 @@ def update_user_coins(user_id, delta, transaction_type="balance_update", source=
             (user_id, delta, transaction_type, source, None, datetime.now().isoformat(), 'completed'))
         conn.commit()
     except Exception as e:
-        print(f"❌ update_user_coins error: {e}")
+        logger.error(f"update_user_coins error: {e}")
         conn.rollback()
     finally:
         conn.close()
@@ -658,7 +709,7 @@ def update_user_stars(user_id, delta, transaction_type="balance_update", source=
             (user_id, delta, transaction_type, source, None, datetime.now().isoformat(), 'completed', payload))
         conn.commit()
     except Exception as e:
-        print(f"❌ update_user_stars error: {e}")
+        logger.error(f"update_user_stars error: {e}")
         conn.rollback()
     finally:
         conn.close()
@@ -717,7 +768,7 @@ def update_system_stats():
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"❌ Update system stats error: {e}")
+        logger.error(f"Update system stats error: {e}")
 
 def get_system_stats():
     try:
@@ -737,7 +788,7 @@ def get_system_stats():
             }
         return {}
     except Exception as e:
-        print(f"❌ Get system stats error: {e}")
+        logger.error(f"Get system stats error: {e}")
         return {}
 
 def get_free_deployment_used_count(user_id):
@@ -795,7 +846,7 @@ def mark_channel_joined(user_id):
         conn.close()
         return True
     except Exception as e:
-        print(f"❌ mark_channel_joined: {e}")
+        logger.error(f"mark_channel_joined: {e}")
         return False
 
 def is_user_verified(user_id) -> bool:
@@ -853,7 +904,7 @@ def mark_tos_accepted(user_id):
         conn.close()
         return True
     except Exception as e:
-        print(f"❌ mark_tos_accepted: {e}")
+        logger.error(f"mark_tos_accepted: {e}")
         return False
 
 def show_tos_prompt(chat_id, user_id, message_id=None):
@@ -1404,7 +1455,6 @@ def admin_code_expiry(admin_id, expiry_days, chat_id, message_id):
     edit_message(chat_id, message_id, text, keyboard)
 
 def admin_add_coins(chat_id, message_id):
-    # Get the admin user ID from the chat
     admin_id = chat_id
     set_user_step(admin_id, 'awaiting_coins_target')
     keyboard = {
@@ -1958,7 +2008,7 @@ def install_dependencies_enhanced(reqs_file, packages_dir=None):
                     failed_packages.append(package)
         return (success_count / len(packages)) >= 0.7 if packages else True, failed_packages
     except Exception as e:
-        print(f"❌ Installer error: {e}")
+        logger.error(f"Installer error: {e}")
         return False, []
 
 # ========== LAUNCHER CREATION ==========
@@ -2383,7 +2433,7 @@ def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: 
                 file_name = dest_script.name
                 file_id = None
             except Exception as e:
-                print(f"❌ GitHub re-download error: {e}")
+                logger.error(f"GitHub re-download error: {e}")
                 conn.close()
                 return False
         else:
@@ -2406,7 +2456,7 @@ def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: 
                             conn.close()
                             return False
                 except Exception as e:
-                    print(f"❌ Failed to download main file: {e}")
+                    logger.error(f"Failed to download main file: {e}")
                     dest_script = deploy_folder / file_name
                     if not dest_script.exists():
                         conn.close()
@@ -2515,7 +2565,7 @@ def restart_deployment_by_id(deployment_id: int, user_id: int, is_auto_restart: 
             return False
     
     except Exception as e:
-        print(f"❌ Restart error: {e}")
+        logger.error(f"Restart error: {e}")
         traceback.print_exc()
         return False
 
@@ -2573,7 +2623,7 @@ def handle_callback(callback):
     data = callback['data']
     
     answer_callback(callback_id)
-    print(f"📨 Callback: {data} from user {user_id}")
+    logger.info(f"Callback: {data} from user {user_id}")
     
     # ========== MAIN MENU ==========
     if data == "main_menu":
@@ -3135,67 +3185,119 @@ def health_monitor():
                     try:
                         os.kill(pid, 0)
                     except (ProcessLookupError, PermissionError):
-                        print(f"💀 Deployment {dep_id} died, restarting...")
+                        logger.info(f"Deployment {dep_id} died, restarting...")
                         restart_deployment_by_id(dep_id, user_id, is_auto_restart=True)
             sleep(60)
         except Exception as e:
-            print(f"⚠️ Health monitor error: {e}")
+            logger.error(f"Health monitor error: {e}")
             sleep(60)
+
+# ========== IMPROVED POLLING LOOP ==========
+def poll_updates():
+    """Safe polling loop with auto-reconnect and error handling"""
+    global LAST_UPDATE_ID
+    consecutive_errors = 0
+    max_consecutive_errors = 10
+    
+    while True:
+        try:
+            # Log heartbeat every 5 minutes
+            if int(time_module.time()) % 300 < 10:
+                logger.info(f"🔄 Bot alive - processing updates (last_id: {LAST_UPDATE_ID})")
+            
+            params = {
+                "offset": LAST_UPDATE_ID + 1,
+                "timeout": 30,
+                "allowed_updates": ["message", "callback_query", "pre_checkout_query", "successful_payment"]
+            }
+            
+            data = http_get(f"{TELEGRAM_API}/getUpdates", params)
+            
+            if data and data.get('ok'):
+                consecutive_errors = 0
+                updates = data.get('result', [])
+                
+                if updates:
+                    logger.info(f"📨 Received {len(updates)} updates")
+                
+                for update in updates:
+                    try:
+                        LAST_UPDATE_ID = update['update_id']
+                        
+                        if 'callback_query' in update:
+                            handle_callback(update['callback_query'])
+                        elif 'pre_checkout_query' in update:
+                            # Handle pre-checkout query
+                            pass
+                        elif 'message' in update:
+                            msg = update['message']
+                            if 'successful_payment' in msg:
+                                # Handle successful payment
+                                pass
+                            else:
+                                handle_message(msg)
+                    except Exception as e:
+                        logger.error(f"Error processing update {update.get('update_id')}: {e}")
+                        traceback.print_exc()
+            else:
+                consecutive_errors += 1
+                if consecutive_errors > max_consecutive_errors:
+                    logger.error(f"Too many consecutive errors ({consecutive_errors}), reconnecting...")
+                    sleep(10)
+                    consecutive_errors = 0
+            
+            sleep(0.5)
+            
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+            break
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            traceback.print_exc()
+            consecutive_errors += 1
+            sleep(5)
 
 # ========== MAIN ==========
 def main():
     global LAST_UPDATE_ID
     
-    print("=" * 70)
-    print("🤖 BOT HOSTING PLATFORM")
-    print("=" * 70)
-    print(f"📁 Data Directory: {BASE_DIR}")
-    print(f"🆓 Free Tier: {FREE_USER_MAX_DEPLOYMENTS} x {FREE_DEPLOYMENT_DURATION_HOURS}h")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info("🤖 BOT HOSTING PLATFORM")
+    logger.info("=" * 70)
+    logger.info(f"Data Directory: {BASE_DIR}")
+    logger.info(f"Free Tier: {FREE_USER_MAX_DEPLOYMENTS} x {FREE_DEPLOYMENT_DURATION_HOURS}h")
+    logger.info("=" * 70)
     
+    # Start health check server
     health_server = start_health_server()
     
+    # Start keep-alive pinger (prevents Render from sleeping)
+    threading.Thread(target=keep_alive_pinger, daemon=True).start()
+    
+    # Initialize database
     init_db()
     update_system_stats()
     
+    # Start health monitor
     threading.Thread(target=health_monitor, daemon=True).start()
     
     try:
         me = http_get(f"{TELEGRAM_API}/getMe")
         if me and me.get('ok'):
-            print(f"✅ Bot: @{me['result']['username']}")
+            logger.info(f"✅ Bot: @{me['result']['username']}")
         else:
-            print("❌ Check BOT_TOKEN!")
+            logger.error("❌ Check BOT_TOKEN!")
             return
     except Exception as e:
-        print(f"❌ Error: {e}")
+        logger.error(f"Error: {e}")
         return
     
-    print("=" * 70)
-    print("✅ Bot running! Press Ctrl+C to stop")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info("✅ Bot running! Press Ctrl+C to stop")
+    logger.info("=" * 70)
     
-    while True:
-        try:
-            params = {"offset": LAST_UPDATE_ID + 1, "timeout": 30}
-            data = http_get(f"{TELEGRAM_API}/getUpdates", params)
-            
-            if data and data.get('ok'):
-                for update in data['result']:
-                    LAST_UPDATE_ID = update['update_id']
-                    
-                    if 'callback_query' in update:
-                        handle_callback(update['callback_query'])
-                    elif 'message' in update:
-                        handle_message(update['message'])
-            sleep(0.5)
-        except KeyboardInterrupt:
-            print("\n🛑 Bot stopped")
-            break
-        except Exception as e:
-            print(f"⚠️ Error: {e}")
-            traceback.print_exc()
-            sleep(5)
+    # Start polling
+    poll_updates()
 
 if __name__ == "__main__":
     main()
