@@ -247,7 +247,6 @@ def init_db():
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
     
-    # Users table with ALL needed columns
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -299,7 +298,6 @@ def init_db():
         temp_code_max_uses INTEGER
     )''')
     
-    # Deployments table
     c.execute('''CREATE TABLE IF NOT EXISTS deployments (
         deployment_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -442,7 +440,6 @@ def init_db():
         reward_given INTEGER DEFAULT 0
     )''')
     
-    # Indexes
     c.execute('CREATE INDEX IF NOT EXISTS idx_deployments_user ON deployments(user_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments(status)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_deployments_expire ON deployments(expire_time)')
@@ -1407,6 +1404,8 @@ def admin_code_expiry(admin_id, expiry_days, chat_id, message_id):
     edit_message(chat_id, message_id, text, keyboard)
 
 def admin_add_coins(chat_id, message_id):
+    # Get the admin user ID from the chat
+    admin_id = chat_id
     set_user_step(admin_id, 'awaiting_coins_target')
     keyboard = {
         "inline_keyboard": [
@@ -1585,7 +1584,6 @@ def admin_coin_confirm(admin_id, chat_id, message_id):
         update_user_coins(int(target_user_id), amount, "admin_add", f"by_admin_{admin_id}")
         new_balance = get_user_balances(int(target_user_id))['coins']
         
-        # Notify user
         try:
             send_message(int(target_user_id),
                 f"🎉 *You received {amount} Coins!*\n\nYour new balance: `{new_balance}🪙`",
@@ -1601,7 +1599,6 @@ def admin_coin_confirm(admin_id, chat_id, message_id):
         edit_message(chat_id, message_id,
             f"❌ Failed to add coins: {e}",
             {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
-        return
 
 def admin_use_my_id(admin_id, chat_id, message_id):
     set_user_step(admin_id, 'awaiting_coins_target', temp_target_user=str(admin_id))
@@ -1633,7 +1630,6 @@ def admin_broadcast_confirm(chat_id, user_id, message_id):
     set_user_step(user_id, None)
     send_message(chat_id, "📤 *Sending broadcast to all users...*")
     
-    # Send to all users
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
     c.execute("SELECT user_id FROM users")
@@ -1692,7 +1688,6 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, env_vars):
                 except Exception:
                     pass
         
-        # Find main file
         dest_script = None
         for candidate in ['main.py', 'bot.py', 'app.py', 'run.py', 'start.py', 'index.py']:
             test_path = deploy_folder / candidate
@@ -2629,6 +2624,11 @@ def handle_callback(callback):
             admin_broadcast_send(chat_id, user_id, message_id)
         return
     
+    if data == "admin_broadcast_confirm":
+        if is_admin(user_id):
+            admin_broadcast_confirm(chat_id, user_id, message_id)
+        return
+    
     # ========== ADMIN CREATE CODE FLOW ==========
     if data.startswith("create_code_"):
         if is_admin(user_id):
@@ -2957,7 +2957,6 @@ def handle_message(message):
         if user_step.get('step') == 'awaiting_broadcast_text':
             if text.strip():
                 set_user_step(user_id, 'awaiting_broadcast_confirm', temp_broadcast_text=text.strip())
-                # Show preview and ask for confirmation
                 keyboard = {"inline_keyboard": [
                     [{"text": "✅ Confirm & Send", "callback_data": "admin_broadcast_confirm"}],
                     [{"text": "✏️ Edit", "callback_data": "admin_broadcast_text"}],
@@ -2968,10 +2967,6 @@ def handle_message(message):
                 send_message(chat_id, "❌ Message cannot be empty.")
             return
         
-        if user_step.get('step') == 'awaiting_broadcast_confirm':
-            # This is handled by the callback above
-            pass
-        
         if not is_user_verified(user_id):
             send_verification_required(chat_id, user_id, first_name, None)
             return
@@ -2979,7 +2974,6 @@ def handle_message(message):
         send_message(chat_id, "❌ Unknown command. Use buttons below.", get_main_menu(user_id))
         return
     
-    # Handle file upload
     if 'document' in message:
         doc = message['document']
         file_name = doc.get('file_name', 'unknown')
